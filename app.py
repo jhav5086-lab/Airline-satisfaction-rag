@@ -65,6 +65,8 @@ def retrieve(query, top_k=6):
         sim = 1 - dist
         if meta["type"] in type_hints:
             sim += 0.20
+        if meta["type"] == "report_page":
+            sim -= 0.15
         ranked.append({"id": cid, "type": meta["type"], "title": meta["title"],
                        "text": doc, "score": sim})
     ranked.sort(key=lambda x: x["score"], reverse=True)
