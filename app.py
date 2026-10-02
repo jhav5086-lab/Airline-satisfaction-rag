@@ -28,7 +28,8 @@ Rules:
 5. For numerical facts, quote the exact number from the context.
 6. If the user asks about causality or ROI, explicitly state the model provides associations, not causal effects.
 7. Never fabricate numbers, features, or claims not present in the context.
-8. When citing numerical values, copy them EXACTLY as they appear."""
+8. When citing numerical values, copy them EXACTLY as they appear. Do not round or approximate.
+9. When the context shows a number like "+5.02", write it exactly as "+5.02". Do NOT write "+4.99", "+5.0", or "approximately 5"."""
 
 USER_TEMPLATE = """CONTEXT CHUNKS:
 {context}
@@ -46,10 +47,14 @@ def retrieve(query, top_k=6):
         type_hints.append("business_levers")
     if any(w in q_lower for w in ["segment","who","cohort","class","demographic"]):
         type_hints.append("segments")
-    if any(w in q_lower for w in ["auc","accuracy","performance","score","brier"]):
+    if any(w in q_lower for w in ["auc","accuracy","performance","score","brier","reliable"]):
         type_hints.append("model_summary")
+    if any(w in q_lower for w in ["methodology","method","how","built","trained","approach",
+                                   "data","features","engineered","why two models",
+                                   "halo","collinear","imputation","bootstrap","cross-validation"]):
+        type_hints.extend(["methodology", "model_summary"])
     q_emb = embedder.encode([query], convert_to_numpy=True)
-    n = top_k * 3 if type_hints else top_k
+    n = top_k * 4 if type_hints else top_k
     results = collection.query(query_embeddings=q_emb.tolist(), n_results=n)
     ranked = []
     for cid, meta, dist, doc in zip(
@@ -58,7 +63,7 @@ def retrieve(query, top_k=6):
     ):
         sim = 1 - dist
         if meta["type"] in type_hints:
-            sim += 0.15
+            sim += 0.20
         ranked.append({"id": cid, "type": meta["type"], "title": meta["title"],
                        "text": doc, "score": sim})
     ranked.sort(key=lambda x: x["score"], reverse=True)
