@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -69,6 +70,14 @@ def retrieve(query, top_k=6):
     ranked.sort(key=lambda x: x["score"], reverse=True)
     return ranked[:top_k]
 
+def verify_numbers(answer, context):
+    """Return list of numbers in answer that don't appear in context."""
+    nums_in_answer = re.findall(r'\b\d[\d,]*\.?\d*\b', answer)
+    ctx_nums = set(re.findall(r'\b\d[\d,]*\.?\d*\b', context))
+    unverified = [n for n in nums_in_answer if n not in ctx_nums]
+    return unverified
+
+
 def ask(question):
     chunks = retrieve(question)
     context = "\n\n".join(f"[{c['title']}]\n{c['text']}" for c in chunks)
@@ -81,7 +90,11 @@ def ask(question):
         temperature=0.1,
         max_tokens=700,
     )
-    return resp.choices[0].message.content, chunks
+    answer = resp.choices[0].message.content
+    unverified = verify_numbers(answer, context)
+    if unverified:
+        answer += f"\n\n_⚠️ Note: the following numbers could not be verified against retrieved sources: {', '.join(set(unverified))}_"
+    return answer, chunks
 
 st.title("🛫 Airline Satisfaction RAG")
 st.caption("Ask questions grounded in coefficients, SHAP, what-if analysis, and the executive report.")
