@@ -1,6 +1,7 @@
 import re
+import json
+import numpy as np
 import streamlit as st
-import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 
@@ -12,12 +13,13 @@ MODEL = "openai/gpt-oss-20b"
 @st.cache_resource
 def load_backend():
     embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    client = chromadb.PersistentClient(path="./chroma")
-    collection = client.get_collection("airline_satisfaction")
+    embeddings = np.load("./embeddings/embeddings.npy")
+    with open("./embeddings/chunks.json") as f:
+        chunks = json.load(f)
     groq_client = Groq(api_key=GROQ_API_KEY)
-    return embedder, collection, groq_client
+    return embedder, embeddings, chunks, groq_client
 
-embedder, collection, groq_client = load_backend()
+embedder, embeddings, chunks, groq_client = load_backend()
 
 SYSTEM_PROMPT = """You are a senior data science consultant answering questions about an airline passenger satisfaction model.
 
@@ -41,36 +43,37 @@ Provide a grounded answer with citations."""
 
 def retrieve(query, top_k=6):
     q_lower = query.lower()
-    type_hints = []
+    type_hints = set()
     if any(w in q_lower for w in ["limitation","caveat","constraint","risk","weakness","problem"]):
-        type_hints.append("caveats")
+        type_hints.add("caveats")
     if any(w in q_lower for w in ["lever","priorit","impact","what-if","improve"]):
-        type_hints.append("business_levers")
+        type_hints.add("business_levers")
     if any(w in q_lower for w in ["segment","who","cohort","class","demographic"]):
-        type_hints.append("segments")
+        type_hints.add("segments")
     if any(w in q_lower for w in ["auc","accuracy","performance","score","brier","reliable"]):
-        type_hints.append("model_summary")
+        type_hints.add("model_summary")
     if any(w in q_lower for w in ["methodology","method","how","built","trained","approach",
                                    "data","features","engineered","why two models",
                                    "halo","collinear","imputation","bootstrap","cross-validation"]):
-        type_hints.extend(["methodology", "model_summary"])
-    q_emb = embedder.encode([query], convert_to_numpy=True)
-    n = top_k * 4 if type_hints else top_k
-    results = collection.query(query_embeddings=q_emb.tolist(), n_results=n)
-    ranked = []
-    for cid, meta, dist, doc in zip(
-        results["ids"][0], results["metadatas"][0],
-        results["distances"][0], results["documents"][0]
-    ):
-        sim = 1 - dist
-        if meta["type"] in type_hints:
-            sim += 0.20
-        if meta["type"] == "report_page":
-            sim -= 0.15
-        ranked.append({"id": cid, "type": meta["type"], "title": meta["title"],
-                       "text": doc, "score": sim})
-    ranked.sort(key=lambda x: x["score"], reverse=True)
-    return ranked[:top_k]
+        type_hints.update(["methodology", "model_summary"])
+    if any(w in q_lower for w in ["test","train","dataset","data size","rows","records","sample"]):
+        type_hints.add("model_summary")
+
+    q_emb = embedder.encode([query], convert_to_numpy=True)[0]
+    emb_norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9
+    q_norm = np.linalg.norm(q_emb) + 1e-9
+    sims = (embeddings / emb_norms) @ (q_emb / q_norm)
+
+    for i, c in enumerate(chunks):
+        if c["type"] in type_hints:
+            sims[i] += 0.20
+        if c["type"] == "report_page":
+            sims[i] -= 0.15
+
+    top_idx = np.argsort(sims)[::-1][:top_k]
+    return [{"id": chunks[i]["id"], "type": chunks[i]["type"],
+             "title": chunks[i]["title"], "text": chunks[i]["text"],
+             "score": float(sims[i])} for i in top_idx]
 
 def verify_numbers(answer, context):
     """Return data-like numbers in answer not in context (with 5% rounding tolerance)."""
@@ -89,19 +92,16 @@ def verify_numbers(answer, context):
             n = float(n_str.replace(',', ''))
         except ValueError:
             continue
-        # Skip tiny numbers — they're usually references, not data
         if n < 1 and '.' not in n_str:
             continue
-        # Consider verified if within 5% of any context number
         if any(abs(n - c) / max(abs(c), 1e-9) < 0.05 for c in ctx_nums):
             continue
         unverified.append(n_str)
     return unverified
 
-
 def ask(question):
-    chunks = retrieve(question)
-    context = "\n\n".join(f"[{c['title']}]\n{c['text']}" for c in chunks)
+    retrieved = retrieve(question)
+    context = "\n\n".join(f"[{c['title']}]\n{c['text']}" for c in retrieved)
     resp = groq_client.chat.completions.create(
         model=MODEL,
         messages=[
@@ -115,7 +115,7 @@ def ask(question):
     unverified = verify_numbers(answer, context)
     if unverified:
         answer += f"\n\n_⚠️ Note: the following numbers could not be verified against retrieved sources: {', '.join(set(unverified))}_"
-    return answer, chunks
+    return answer, retrieved
 
 st.title("🛫 Airline Satisfaction RAG")
 st.caption("Ask questions grounded in coefficients, SHAP, what-if analysis, and the executive report.")
@@ -133,6 +133,7 @@ with st.sidebar:
         "What is the odds ratio for Customer Type?",
         "What should the airline do to improve satisfaction?",
         "Is Age a driver of satisfaction?",
+        "What is the test set size?",
     ]
     for q in sample_qs:
         if st.button(q, use_container_width=True):
@@ -151,10 +152,10 @@ def process(q):
         st.markdown(q)
     with st.chat_message("assistant"):
         with st.spinner("Searching corpus..."):
-            ans, chunks = ask(q)
+            ans, retrieved = ask(q)
         st.markdown(ans)
         with st.expander("Sources"):
-            for c in chunks:
+            for c in retrieved:
                 st.markdown(f"**{c['title']}** ({c['type']}) — score {c['score']:.3f}")
         st.session_state.messages.append({"role": "assistant", "content": ans})
 
