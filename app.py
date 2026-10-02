@@ -71,9 +71,11 @@ def retrieve(query, top_k=6):
     return ranked[:top_k]
 
 def verify_numbers(answer, context):
-    """Return list of numbers in answer that don't appear in context."""
-    nums_in_answer = re.findall(r'\b\d[\d,]*\.?\d*\b', answer)
-    ctx_nums = set(re.findall(r'\b\d[\d,]*\.?\d*\b', context))
+    """Return list of data-like numbers in answer that don't appear in context.
+    Ignores bare integers (which are usually citations/rule numbers)."""
+    pattern = r'\b\d+\.\d+\b|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b'
+    nums_in_answer = re.findall(pattern, answer)
+    ctx_nums = set(re.findall(pattern, context))
     unverified = [n for n in nums_in_answer if n not in ctx_nums]
     return unverified
 
