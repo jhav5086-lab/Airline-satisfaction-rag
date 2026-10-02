@@ -1,0 +1,198 @@
+{
+  "created": "2026-10-02T05:34:48.623557",
+  "chunk_count": 32,
+  "chunks": [
+    {
+      "id": "model_card",
+      "type": "model_summary",
+      "title": "Model Overview",
+      "text": "Predicting Airline Satisfaction \u2014 Model Overview. Training set: 699,635 passenger records. Test set: 242,739 records. Model: Logistic Regression (L2 penalty, C=1.0, lbfgs solver). Evaluation: 5-fold stratified cross-validation. Model A (predictive) AUC: 0.9423 with 95% confidence interval [0.9417, 0.9429]. Model B (interpretive) AUC: 0.9228. Brier score: 0.0826. Average precision: 0.9228. Baseline satisfaction rate: 44.4% (mild imbalance, ratio 1.25). Public leaderboard score: 0.94191."
+    },
+    {
+      "id": "methodology",
+      "type": "methodology",
+      "title": "Methodology",
+      "text": "Two logistic regression models were trained. Model A includes all raw service ratings (33 features) and is used for prediction, achieving AUC 0.9423. Model B excludes raw ratings and uses only aggregate features (20 features) including service mean, service min, and service std, achieving AUC 0.9228. Model B exists because survey ratings exhibit a strong halo effect \u2014 passengers rate all service dimensions correlatedly \u2014 which creates irreducible multicollinearity in any model with all raw ratings. Model B's design matrix is full rank (20/20), so coefficients are uniquely identified with valid confidence intervals and p-values. Rating zeros (survey skips) were replaced with neutral rating 3, with a separate '_not_rated' indicator flag created for each column. Delay features were bucketed into 5 tiers (none, short, medium, long, extreme) and raw minutes were dropped to prevent collinearity. Rare indicator flags (prevalence less than 2%) were pruned. Confidence intervals computed via bootstrap resampling (300 iterations). Coefficient inference uses maximum-likelihood logit on a 150,000-row subsample."
+    },
+    {
+      "id": "shap_top10",
+      "type": "feature_importance",
+      "title": "Top 10 SHAP Drivers",
+      "text": "Top feature importance drivers by SHAP value (average absolute SHAP contribution to model predictions):\n  1. Type Of Travel: mean |SHAP| = 1.0432\n  2. Customer Type: mean |SHAP| = 0.7367\n  3. Online Boarding: mean |SHAP| = 0.6929\n  4. Service Std: mean |SHAP| = 0.6551\n  5. Inflight Wifi Service: mean |SHAP| = 0.6499\n  6. Service Min: mean |SHAP| = 0.3539\n  7. Departure/Arrival Time Convenient: mean |SHAP| = 0.3314\n  8. Class: mean |SHAP| = 0.2993\n  9. Service Mean: mean |SHAP| = 0.2444\n  10. On-Board Service: mean |SHAP| = 0.2294\nInterpretation: Type of Travel (Business vs Personal) is the single strongest predictor. Customer Type (Loyal vs disloyal) ranks second. Online boarding is the top actionable service lever. Inflight WiFi follows closely. service_std (rating variance) ranks fifth."
+    },
+    {
+      "id": "whatif_levers",
+      "type": "business_levers",
+      "title": "What-If Business Lever Analysis",
+      "text": "Business lever prioritization via what-if simulation. Each row shows the model-predicted change in average satisfaction probability if that lever improves by +1 rating across all passengers:\n  \u2022 Online Boarding: lift +4.99 percentage points, cost low, timeline 6 months, priority score 4.99\n  \u2022 On-Board Service: lift +1.56 percentage points, cost low, timeline 3 months, priority score 3.12\n  \u2022 Cleanliness: lift +1.00 percentage points, cost low, timeline 2 months, priority score 3.01\n  \u2022 Checkin Service: lift +1.63 percentage points, cost low, timeline 4 months, priority score 2.44\n  \u2022 Inflight Wifi Service: lift +5.37 percentage points, cost high, timeline 9 months, priority score 1.19\n  \u2022 Ease Of Online Booking: lift +0.99 percentage points, cost low, timeline 5 months, priority score 1.19\n  \u2022 Baggage Handling: lift +0.88 percentage points, cost medium, timeline 6 months, priority score 0.44\n  \u2022 Inflight Entertainment: lift +0.35 percentage points, cost high, timeline 18 months, priority score 0.04\n  \u2022 Leg Room Service: lift +0.87 percentage points, cost very_high, timeline 36 months, priority score 0.04\n  \u2022 Seat Comfort: lift +0.15 percentage points, cost very_high, timeline 36 months, priority score 0.01\nPriority score = lift_pp / (cost_weight \u00d7 time_weight). Highest priority score is Online boarding (+5.02 pp, low cost, 6 months, score 5.02). The Food and Drink lever was excluded because its what-if estimate was negative \u2014 a statistical artifact of collinearity, not a real signal."
+    },
+    {
+      "id": "coefficients_top15",
+      "type": "coefficients",
+      "title": "Model B Coefficients \u2014 Top 15",
+      "text": "Interpretive coefficients from Model B (statistically valid, full-rank design). Odds ratios greater than 1 indicate positive association with satisfaction:\n  \u2022 Service Mean: coefficient 1.495, odds ratio 4.457 (95% CI [4.346, 4.571]), p < 0.001 (significant)\n  \u2022 Type Of Travel: coefficient 1.261, odds ratio 3.528 (95% CI [3.446, 3.611]), p < 0.001 (significant)\n  \u2022 Customer Type: coefficient 0.790, odds ratio 2.204 (95% CI [2.161, 2.247]), p < 0.001 (significant)\n  \u2022 Service Std: coefficient 0.674, odds ratio 1.962 (95% CI [1.917, 2.007]), p < 0.001 (significant)\n  \u2022 Class: coefficient 0.450, odds ratio 1.568 (95% CI [1.535, 1.601]), p < 0.001 (significant)\n  \u2022 Ease Of Online Booking Not Rated: coefficient 0.358, odds ratio 1.431 (95% CI [1.409, 1.454]), p < 0.001 (significant)\n  \u2022 Service Min: coefficient 0.236, odds ratio 1.266 (95% CI [1.230, 1.303]), p < 0.001 (significant)\n  \u2022 Departure/Arrival Time Convenient Not Rated: coefficient 0.156, odds ratio 1.168 (95% CI [1.150, 1.187]), p < 0.001 (significant)\n  \u2022 Delay Inconsistency: coefficient -0.110, odds ratio 0.896 (95% CI [0.881, 0.910]), p < 0.001 (significant)\n  \u2022 Delay Medium: coefficient -0.093, odds ratio 0.911 (95% CI [0.897, 0.925]), p < 0.001 (significant)\n  \u2022 Log Distance: coefficient 0.053, odds ratio 1.055 (95% CI [1.021, 1.090]), p = 0.0014 (significant)\n  \u2022 Delay Short: coefficient -0.028, odds ratio 0.973 (95% CI [0.957, 0.988]), p < 0.001 (significant)\n  \u2022 Gender: coefficient -0.027, odds ratio 0.974 (95% CI [0.959, 0.989]), p < 0.001 (significant)\n  \u2022 Delay Long: coefficient -0.015, odds ratio 0.985 (95% CI [0.967, 1.003]), p = 0.1015 (not significant)\n  \u2022 Is Minor: coefficient 0.013, odds ratio 1.013 (95% CI [0.992, 1.035]), p = 0.2138 (not significant)\n"
+    },
+    {
+      "id": "coefficient_service_mean",
+      "type": "coefficient_detail",
+      "title": "Coefficient Detail \u2014 Service Mean",
+      "text": "Feature: Service Mean. Coefficient: 1.4945. Odds ratio: 4.4571. 95% confidence interval: [4.3461, 4.5710]. p-value: 0.00e+00. Effect is statistically significant. A 1-standard-deviation increase in Service Mean multiplies the odds of satisfaction by approximately 4.46."
+    },
+    {
+      "id": "coefficient_Type of Travel",
+      "type": "coefficient_detail",
+      "title": "Coefficient Detail \u2014 Type Of Travel",
+      "text": "Feature: Type Of Travel. Coefficient: 1.2606. Odds ratio: 3.5276. 95% confidence interval: [3.4460, 3.6112]. p-value: 0.00e+00. Effect is statistically significant. A 1-standard-deviation increase in Type Of Travel multiplies the odds of satisfaction by approximately 3.53."
+    },
+    {
+      "id": "coefficient_Customer Type",
+      "type": "coefficient_detail",
+      "title": "Coefficient Detail \u2014 Customer Type",
+      "text": "Feature: Customer Type. Coefficient: 0.7901. Odds ratio: 2.2035. 95% confidence interval: [2.1613, 2.2466]. p-value: 0.00e+00. Effect is statistically significant. A 1-standard-deviation increase in Customer Type multiplies the odds of satisfaction by approximately 2.20."
+    },
+    {
+      "id": "coefficient_service_std",
+      "type": "coefficient_detail",
+      "title": "Coefficient Detail \u2014 Service Std",
+      "text": "Feature: Service Std. Coefficient: 0.6737. Odds ratio: 1.9615. 95% confidence interval: [1.9174, 2.0067]. p-value: 0.00e+00. Effect is statistically significant. A 1-standard-deviation increase in Service Std multiplies the odds of satisfaction by approximately 1.96."
+    },
+    {
+      "id": "coefficient_Class",
+      "type": "coefficient_detail",
+      "title": "Coefficient Detail \u2014 Class",
+      "text": "Feature: Class. Coefficient: 0.4496. Odds ratio: 1.5677. 95% confidence interval: [1.5349, 1.6012]. p-value: 0.00e+00. Effect is statistically significant. A 1-standard-deviation increase in Class multiplies the odds of satisfaction by approximately 1.57."
+    },
+    {
+      "id": "segments",
+      "type": "segments",
+      "title": "Segment-Level Satisfaction",
+      "text": "Satisfaction rate by passenger segment (Class \u00d7 Type of Travel):\n  \u2022 Eco \u00b7 Personal: satisfaction rate 9.7% (n=185,792)\n  \u2022 Eco \u00b7 Business: satisfaction rate 26.0% (n=141,612)\n  \u2022 Eco Plus \u00b7 Personal: satisfaction rate 9.5% (n=12,462)\n  \u2022 Eco Plus \u00b7 Business: satisfaction rate 34.6% (n=17,557)\n  \u2022 Business \u00b7 Personal: satisfaction rate 11.2% (n=3,940)\n  \u2022 Business \u00b7 Business: satisfaction rate 73.2% (n=338,272)\nBusiness class Business travelers: 73.2% satisfied \u2014 highest cohort. Economy Personal travelers: 9.7% satisfied \u2014 lowest cohort. Satisfaction varies dramatically by segment \u2014 this is the strongest predictor in the model."
+    },
+    {
+      "id": "recommendations",
+      "type": "recommendations",
+      "title": "Priority Recommendations",
+      "text": "Recommended priority actions (model-predicted associations, not causal effects): P1 \u2014 Online Boarding: +5.0 percentage-point predicted lift, low cost, 6-month timeline. The single best investment under the priority heuristic. P1 \u2014 On-Board Service: +1.6 pp lift, low cost, 3-month timeline. P2 \u2014 Cleanliness: +1.0 pp, low cost, 2-month timeline. P2 \u2014 Check-in Service: +1.6 pp, low cost, 4-month timeline. P2 \u2014 WiFi Upgrade: highest absolute lift (+5.4 pp) but high cost and 9-month horizon. P3 \u2014 Inflight entertainment, leg room, seat comfort: capital-intensive retrofits, defer."
+    },
+    {
+      "id": "limitations",
+      "type": "caveats",
+      "title": "Limitations & Caveats",
+      "text": "Critical caveats for interpreting this model's outputs: This analysis identifies STATISTICAL ASSOCIATIONS, NOT CAUSAL EFFECTS. All lift estimates are model-predicted changes in probability, not field outcomes. A controlled pilot is required to establish whether improving a lever actually causes satisfaction to rise. Financial ROI cannot be computed without revenue-per-passenger and cost-of-implementation data, which are not present in this dataset. The priority score is a ranking heuristic, not a financial return. There is a halo effect in survey ratings \u2014 passengers rate service dimensions correlatedly \u2014 which means individual touchpoint contributions cannot be cleanly separated. service_std (rating variance) has a positive coefficient that is counterintuitive; possible interpretations are respondent engagement or a selection artifact. The dataset appears synthetically generated; real-world effect sizes may differ."
+    },
+    {
+      "id": "pdf_page_1",
+      "type": "report_page",
+      "title": "Report \u2014 Page 1",
+      "text": "Airline Passenger Satisfaction\n Predictive Model & Business Insight Report\n Prepared: October 02, 2026\nTraining set: 699,635 passenger records\n Test set: 242,739 passenger records\nModel: Logistic Regression (L2, C=1.0)\nEvaluation: 5-fold stratified cross-validation"
+    },
+    {
+      "id": "pdf_page_2",
+      "type": "report_page",
+      "title": "Report \u2014 Page 2",
+      "text": "Airline Satisfaction Report \u00b7 Page 2\n1. Executive Summary\n 0.9423\n 0.0826\n 699,635\n 44.4%\n Model AUC\n95% CI: 0.9417\u20130.9429\n Brier Score\n(lower = better)\n Passengers\n analyzed\n Baseline\nsatisfaction rate\nKey Findings\n1. Segment dominates satisfaction. Type of Travel and Customer Type are the two strongest predictors \u2014\ntogether carrying more signal than any individual service touchpoint.\n2. Online boarding is the highest-leverage service lever. A +1-rating improvement is associated with a\n+5.0 percentage-point increase in predicted satisfaction probability \u2014 at low cost and a 6-month timeline.\n3. WiFi quality is the largest absolute lever. +5.4 pp predicted lift, but high cost and 9-month horizon push\nit to P3 on the priority heuristic.\n4. Consistency of experience ranks #5 in SHAP importance. Passengers with varied ratings tend to be\nmore satisfied than those who rate uniformly \u2014 but this likely reflects respondent engagement rather than a\ncausal lever.\n5. Demographics (age, gender) do not materially drive satisfaction. Once segment and service are\naccounted for, age and gender have near-zero, statistically non-significant effects.\nRecommended priority actions (model-predicted associations)\nP1 \u2014 Online Boarding: +5.0 pp predicted lift, low cost, 6-month timeline.\nP1 \u2014 On-Board Service: +1.6 pp lift, low cost, 3-month timeline.\nP2 \u2014 Cleanliness: +1.0 pp, low cost, 2-month timeline.\nP2 \u2014 Check-in Service: +1.6 pp, low cost, 4-month timeline.\nP2 \u2014 WiFi Upgrade: highest absolute lift (+5.4 pp); requires cost approval.\nCritical caveat \u2014 read before acting\nThis analysis identifies statistical associations, not causal effects. All lift estimates are model-predicted changes\nin probability, not field outcomes. Financial ROI cannot be computed without revenue-per-passenger and\ncost-of-implementation data. Validate priority actions with a controlled pilot before committing capital."
+    },
+    {
+      "id": "pdf_page_3",
+      "type": "report_page",
+      "title": "Report \u2014 Page 3",
+      "text": "Airline Satisfaction Report \u00b7 Page 3\n2. Methodology\n2.1 Data\n \u007f Source: Passenger satisfaction survey with 21 features.\n\u007f Target: Binary satisfaction indicator \u2014 44.4% satisfied baseline.\n\u007f Data quality: Rating zeros (skips) treated as distinct state with flags; delays bucketed into 5 tiers;\ncollinear features pruned.\n2.2 Modeling Strategy\nModel\nPurpose\nFeatures\nAUC (5-fold CV)\nModel A\nBest prediction \u2014 includes all raw service ratings\n33\n0.9423\nModel B\nInterpretation \u2014 aggregate features only; full-rank design\n20\n0.9228\n2.3 Why Two Models?\nSurvey ratings exhibit a strong halo effect \u2014 passengers rate service dimensions correlatedly. This\nproduces irreducible multicollinearity. Model A achieves best prediction; Model B sacrifices touchpoint\ngranularity for statistically valid coefficients.\nApproach Summary\nComponent\nApproach\nMissing ratings (0 in survey)\nReplaced with neutral rating 3; indicator created per column\nDelay features\nBucketed into 5 tiers; raw minutes dropped\nFeature pruning\nRedundant aggregates and rare flags (< 2%) removed\nCross-validation\n5-fold stratified, random seed 42\nConfidence intervals\nBootstrap resampling (300 iterations)\nCoefficient inference\nMaximum-likelihood logit on 150K sample"
+    },
+    {
+      "id": "pdf_page_4",
+      "type": "report_page",
+      "title": "Report \u2014 Page 4",
+      "text": "Airline Satisfaction Report \u00b7 Page 4\n3. Model Performance\n 0.9423\n 0.9228\n 0.0826\n 0.9228\n Model A AUC\n Model B AUC\n Brier Score\n Average Precision\nThe model correctly ranks a randomly chosen satisfied passenger above a randomly chosen unsatisfied\npassenger 94.2% of the time. The Brier score of 0.0826 indicates well-calibrated probabilities.\n Figure 1: ROC curve \u2014 Model A (blue) and Model B (orange) versus random baseline."
+    },
+    {
+      "id": "pdf_page_5",
+      "type": "report_page",
+      "title": "Report \u2014 Page 5",
+      "text": "Airline Satisfaction Report \u00b7 Page 5\n3.1 Calibration\nPredicted probabilities align closely with observed satisfaction rates. The model tracks well above 0.5 and\nslightly under-predicts at low probabilities.\n Figure 2: Calibration curve \u2014 predicted vs observed across 15 bins."
+    },
+    {
+      "id": "pdf_page_6",
+      "type": "report_page",
+      "title": "Report \u2014 Page 6",
+      "text": "Airline Satisfaction Report \u00b7 Page 6\n4. Feature Importance (SHAP)\nSHAP values quantify each feature's average contribution to model predictions.\nFeature\nMean |SHAP|\nType Of Travel\n1.0432\nCustomer Type\n0.7367\nOnline Boarding\n0.6929\nService Std\n0.6551\nInflight Wifi Service\n0.6499\nService Min\n0.3539\nDeparture/Arrival Time Convenient\n0.3314\nClass\n0.2993\nService Mean\n0.2444\nOn-Board Service\n0.2294\n Figure 3: Global feature importance."
+    },
+    {
+      "id": "pdf_page_7",
+      "type": "report_page",
+      "title": "Report \u2014 Page 7",
+      "text": "Airline Satisfaction Report \u00b7 Page 7\n4.1 Direction of Effects (SHAP Beeswarm)\n Figure 4: SHAP beeswarm \u2014 direction of effects per passenger.\nInterpretation\n \u007f Type of Travel is the single strongest predictor \u2014 Business travelers report materially higher\nsatisfaction.\n\u007f Customer Type (Loyal vs disloyal) ranks second.\n\u007f Online boarding is the top actionable service lever.\n\u007f Inflight WiFi follows closely \u2014 digital connectivity is a baseline expectation.\n\u007f service_std (rating variance) ranks fifth. See \u00a75.1 for caveat."
+    },
+    {
+      "id": "pdf_page_8",
+      "type": "report_page",
+      "title": "Report \u2014 Page 8",
+      "text": "Airline Satisfaction Report \u00b7 Page 8\n5. Interpretive Coefficients (Model B)\nModel B coefficients are statistically valid \u2014 design matrix is full-rank (20/20). Odds ratios > 1 indicate\npositive association; < 1 negative.\nFeature\nCoef\nOdds Ratio\n95% CI\np-value\nService Mean\n1.495\n4.457\n[4.35, 4.57]\n< 0.001\nType Of Travel\n1.261\n3.528\n[3.45, 3.61]\n< 0.001\nCustomer Type\n0.790\n2.204\n[2.16, 2.25]\n< 0.001\nService Std\n0.674\n1.962\n[1.92, 2.01]\n< 0.001\nClass\n0.450\n1.568\n[1.53, 1.60]\n< 0.001\nEase Of Online Booking Not Rated\n0.358\n1.431\n[1.41, 1.45]\n< 0.001\nService Min\n0.236\n1.266\n[1.23, 1.30]\n< 0.001\nDeparture/Arrival Time Convenient Not Rated\n0.156\n1.168\n[1.15, 1.19]\n< 0.001\nDelay Inconsistency\n-0.110\n0.896\n[0.88, 0.91]\n< 0.001\nDelay Medium\n-0.093\n0.911\n[0.90, 0.93]\n< 0.001\nLog Distance\n0.053\n1.055\n[1.02, 1.09]\n0.0014\nDelay Short\n-0.028\n0.973\n[0.96, 0.99]\n< 0.001\n Coefficients on standardized features; odds ratios represent multiplicative change per 1-SD increase.\n Figure 5: Model B coefficients."
+    },
+    {
+      "id": "pdf_page_9",
+      "type": "report_page",
+      "title": "Report \u2014 Page 9",
+      "text": "Airline Satisfaction Report \u00b7 Page 9\n5.1 Odds Ratios & Interpretation\n Figure 6: Odds ratios with 95% CIs.\nReading the Coefficients\n \u007f service_mean (OR \u2248 4.46): A 1-SD increase in avg service rating multiplies satisfaction odds by ~4.5\u00d7.\n\u007f Type of Travel (OR \u2248 3.53): Business-travel passengers have ~3.5\u00d7 higher odds.\n\u007f Customer Type (OR \u2248 2.20): Loyal customers have ~2.2\u00d7 higher odds.\n\u007f service_std (OR \u2248 1.96): Higher rating variance correlates with higher satisfaction \u2014 see caveat.\n\u007f Class (OR \u2248 1.57): Each step up in cabin class multiplies odds by ~1.57\u00d7.\n\u007f delay_medium (OR \u2248 0.91): 16\u201360 min delays reduce odds by ~9%.\nNote on the service_std direction\nA positive coefficient on rating variance is counterintuitive. Two interpretations exist:\n\u007f Engagement: Passengers who rate with variation are opinionated and engaged.\n\u007f Selection artifact: May reflect a demographic or segment confound.\nWe cannot distinguish without controlled data. Do not treat \u201cincrease rating variance\u201d as an actionable lever."
+    },
+    {
+      "id": "pdf_page_10",
+      "type": "report_page",
+      "title": "Report \u2014 Page 10",
+      "text": "Airline Satisfaction Report \u00b7 Page 10\n6. Business Levers \u2014 What-If Analysis\nFor each service touchpoint, we simulated a +1-rating improvement across all test-set passengers and\nmeasured the resulting change in average predicted satisfaction probability.\nLever\nLift (pp)\nCost\nTimeline\nPriority Score\nOnline Boarding\n+4.99 pp\nLow\n6 mo\n4.99\nOn-Board Service\n+1.56 pp\nLow\n3 mo\n3.12\nCleanliness\n+1.00 pp\nLow\n2 mo\n3.01\nCheckin Service\n+1.63 pp\nLow\n4 mo\n2.44\nInflight Wifi Service\n+5.37 pp\nHigh\n9 mo\n1.19\nEase Of Online Booking\n+0.99 pp\nLow\n5 mo\n1.19\nBaggage Handling\n+0.88 pp\nMedium\n6 mo\n0.44\nInflight Entertainment\n+0.35 pp\nHigh\n18 mo\n0.04\nLeg Room Service\n+0.87 pp\nVery High\n36 mo\n0.04\nSeat Comfort\n+0.15 pp\nVery High\n36 mo\n0.01\n Figure 7: Predicted satisfaction lift per lever."
+    },
+    {
+      "id": "pdf_page_11",
+      "type": "report_page",
+      "title": "Report \u2014 Page 11",
+      "text": "Airline Satisfaction Report \u00b7 Page 11\n6.1 How to Read the What-If Table\n \u007f Lift (pp): Model-predicted change in average satisfaction probability, in percentage points.\n\u007f Cost: Subjective cost category \u2014 a ranking aid, not a financial figure.\n\u007f Timeline: Estimated months to full deployment.\n\u007f Priority Score: Lift \u00f7 (cost weight \u00d7 time weight). Higher = better risk-adjusted priority.\nReliability note\nThe \u201cFood and Drink\u201d lever was excluded from this table. Its what-if estimate came back negative \u2014 a statistical\nartifact of source-data collinearity, not a real business signal."
+    },
+    {
+      "id": "pdf_page_12",
+      "type": "report_page",
+      "title": "Report \u2014 Page 12",
+      "text": "Airline Satisfaction Report \u00b7 Page 12\n7. Segment Insights\nSatisfaction varies dramatically by passenger segment. These differences are the strongest predictors in the\nmodel.\nSegment\nSatisfaction Rate\nSample Size\nEco \u00b7 Personal\n9.7%\n185,792\nEco \u00b7 Business\n26.0%\n141,612\nEco Plus \u00b7 Personal\n9.5%\n12,462\nEco Plus \u00b7 Business\n34.6%\n17,557\nBusiness \u00b7 Personal\n11.2%\n3,940\nBusiness \u00b7 Business\n73.2%\n338,272\n Figure 8: Satisfaction rate heatmap by Class \u00d7 Travel Type."
+    },
+    {
+      "id": "pdf_page_13",
+      "type": "report_page",
+      "title": "Report \u2014 Page 13",
+      "text": "Airline Satisfaction Report \u00b7 Page 13\n7.1 Satisfaction by Rating Level\n Figure 9: Satisfaction rate by rating level for key service levers.\nBusiness Implication\n \u007f Personal / Economy travelers are the largest low-satisfaction cohort \u2014 target digital journey and basic\ncomfort improvements here.\n\u007f Business travelers are already high-satisfaction \u2014 protect this base but do not over-invest.\n\u007f Loyal customers provide a reinforcing flywheel \u2014 invest in retention."
+    },
+    {
+      "id": "pdf_page_14",
+      "type": "report_page",
+      "title": "Report \u2014 Page 14",
+      "text": "Airline Satisfaction Report \u00b7 Page 14\n8. Recommendations\nRanked by model-predicted impact and priority heuristic. Priority tiers: P1 = highest ROI, P2 = strong\nsecondary, P3 = long-term.\nPriority\nLever\nLift (pp)\nCost\nTimeline\nScore\nP1\nOnline Boarding\n+4.99 pp\nLow\n6 mo\n4.99\nP1\nOn-Board Service\n+1.56 pp\nLow\n3 mo\n3.12\nP2\nCleanliness\n+1.00 pp\nLow\n2 mo\n3.01\nP2\nCheckin Service\n+1.63 pp\nLow\n4 mo\n2.44\nP2\nInflight Wifi Service\n+5.37 pp\nHigh\n9 mo\n1.19\nP3\nEase Of Online Booking\n+0.99 pp\nLow\n5 mo\n1.19\nP3\nBaggage Handling\n+0.88 pp\nMedium\n6 mo\n0.44\nP3\nInflight Entertainment\n+0.35 pp\nHigh\n18 mo\n0.04\nP3\nLeg Room Service\n+0.87 pp\nVery High\n36 mo\n0.04\nP3\nSeat Comfort\n+0.15 pp\nVery High\n36 mo\n0.01\nDetailed Recommendations\nP1 \u2014 Online Boarding\nModel-predicted lift: +5.0 pp. Low cost, 6-month deployment. The single best investment. Actionable via\nmobile check-in, boarding-pass simplification, and digital gate coordination.\nP1 \u2014 On-Board Service\n+1.6 pp lift. Low cost, 3-month deployment. Crew training and service protocol refreshers.\nP2 \u2014 Cleanliness\n+1.0 pp lift. Low cost, 2-month deployment. Turnaround crew staffing and consumable refresh.\nP2 \u2014 Check-in Service\n+1.6 pp lift. Low cost, 4-month deployment. Counter staffing, kiosk reliability, mobile check-in flow.\nP2 \u2014 Inflight WiFi (largest absolute lift, longer horizon)\n+5.4 pp lift \u2014 largest of any service lever. High cost and 9-month deployment. Pair with cost-benefit\nanalysis.\nP3 \u2014 Deferred\nInflight entertainment, leg room, seat comfort require capital-intensive retrofits."
+    },
+    {
+      "id": "pdf_page_15",
+      "type": "report_page",
+      "title": "Report \u2014 Page 15",
+      "text": "Airline Satisfaction Report \u00b7 Page 15\n9. Limitations & Caveats\n What this model CAN tell you\n\u007f Which service touchpoints are most associated with passenger satisfaction.\n\u007f How much predicted satisfaction probability changes if a touchpoint improves.\n\u007f Which passenger segments have systematically different satisfaction profiles.\nWhat this model CANNOT tell you\n\u007f Causality. All effects are observational. A controlled pilot is required to establish causal effect.\n\u007f Financial ROI. Revenue per passenger, upgrade cost, churn elasticity are not in the data.\n\u007f Field-effect magnitude. Lift estimates are model-implied and may not translate one-to-one.\n\u007f Behavioral intent. Survey answers are self-reported.\nAdditional Caveats\n \u007f Halo effect in ratings. Passengers rate service dimensions correlatedly. Model A keeps all ratings for\nprediction; only Model B's aggregate coefficients are statistically valid for inference.\n\u007f Synthetic dataset. Appears synthetically generated based on real airline survey structure. Real-world\neffect sizes may differ.\n\u007f service_std direction. The positive coefficient on rating variance is interpreted as engagement, but this\nis one of several possible readings.\n\u007f What-if reliability. Model A's predictions are accurate within the observed feature distribution but less\nreliable for out-of-distribution simulations."
+    },
+    {
+      "id": "pdf_page_16",
+      "type": "report_page",
+      "title": "Report \u2014 Page 16",
+      "text": "Airline Satisfaction Report \u00b7 Page 16\nAppendix A \u2014 Full Coefficient Table (Model B)\nComplete statistical output for the interpretive model.\nFeature\nCoef\nOR\nCI Low\nCI High\np\nService Mean\n1.495\n4.457\n4.346\n4.571\n< 0.001\nType Of Travel\n1.261\n3.528\n3.446\n3.611\n< 0.001\nCustomer Type\n0.790\n2.204\n2.161\n2.247\n< 0.001\nService Std\n0.674\n1.962\n1.917\n2.007\n< 0.001\nConst\n-0.522\n0.594\n0.584\n0.603\n< 0.001\nClass\n0.450\n1.568\n1.535\n1.601\n< 0.001\nEase Of Online Booking Not Rated\n0.358\n1.431\n1.409\n1.454\n< 0.001\nService Min\n0.236\n1.266\n1.230\n1.303\n< 0.001\nDeparture/Arrival Time Convenient Not\nRated\n0.156\n1.168\n1.150\n1.187\n< 0.001\nDelay Inconsistency\n-0.110\n0.896\n0.881\n0.910\n< 0.001\nDelay Medium\n-0.093\n0.911\n0.897\n0.925\n< 0.001\nLog Distance\n0.053\n1.055\n1.021\n1.090\n0.0014\nDelay Short\n-0.028\n0.973\n0.957\n0.988\n< 0.001\nGender\n-0.027\n0.974\n0.959\n0.989\n< 0.001\nDelay Long\n-0.015\n0.985\n0.967\n1.003\n0.1015\nIs Minor\n0.013\n1.013\n0.992\n1.035\n0.2138\nArrival Delay Was Missing\n-0.007\n0.993\n0.977\n1.009\n0.3749\nDelay Extreme\n-0.006\n0.994\n0.977\n1.010\n0.4565\nIs Long Haul\n0.002\n1.002\n0.976\n1.029\n0.8802\nAge\n-0.002\n0.998\n0.978\n1.018\n0.8420\nIs Short Haul\n-0.002\n0.998\n0.977\n1.020\n0.8759"
+    },
+    {
+      "id": "pdf_page_17",
+      "type": "report_page",
+      "title": "Report \u2014 Page 17",
+      "text": "Airline Satisfaction Report \u00b7 Page 17\nAppendix B \u2014 Model A Feature List\nFeatures used in Model A (33 total):\n \u007f Age\n\u007f Inflight wifi service\n\u007f Departure/Arrival time convenient\n\u007f Ease of Online booking\n\u007f Gate location\n\u007f Food and drink\n\u007f Online boarding\n\u007f Seat comfort\n\u007f Inflight entertainment\n\u007f On-board service\n\u007f Leg room service\n\u007f Baggage handling\n\u007f Checkin service\n\u007f Cleanliness\n\u007f Gender\n\u007f Customer Type\n\u007f Type of Travel\n\u007f Class\n\u007f Departure/Arrival time convenient not rated\n\u007f Ease of Online booking not rated\n\u007f arrival delay was missing\n\u007f delay inconsistency\n\u007f delay short\n\u007f delay medium\n\u007f delay long\n\u007f delay extreme\n\u007f service min\n\u007f service std\n\u007f service mean\n\u007f is minor\n\u007f log distance\n\u007f is short haul\n\u007f is long haul\nAppendix C \u2014 Model B Feature List\nFeatures used in Model B (20 total \u2014 excludes raw ratings):\n \u007f Age\n\u007f Gender"
+    },
+    {
+      "id": "pdf_page_18",
+      "type": "report_page",
+      "title": "Report \u2014 Page 18",
+      "text": "Airline Satisfaction Report \u00b7 Page 18\n\u007f Customer Type\n\u007f Type of Travel\n\u007f Class\n\u007f Departure/Arrival time convenient not rated\n\u007f Ease of Online booking not rated\n\u007f arrival delay was missing\n\u007f delay inconsistency\n\u007f delay short\n\u007f delay medium\n\u007f delay long\n\u007f delay extreme\n\u007f service min\n\u007f service std\n\u007f service mean\n\u007f is minor\n\u007f log distance\n\u007f is short haul\n\u007f is long haul"
+    },
+    {
+      "id": "pdf_page_19",
+      "type": "report_page",
+      "title": "Report \u2014 Page 19",
+      "text": "Airline Satisfaction Report \u00b7 Page 19\nAppendix D \u2014 Reproducibility\n \u007f Random seed: 42\n\u007f Cross-validation: 5-fold stratified on target\n\u007f Model: LogisticRegression(penalty='l2', C=1.0, solver='lbfgs', max_iter=3000)\n\u007f Coefficient inference: statsmodels.Logit(method='lbfgs') on 150K-row subsample\n\u007f SHAP: LinearExplainer with 5,000-sample test subset\n\u007f Environment: Google Colab free tier, Python 3.13\n Report generated 2026-10-02 05:34 \u00b7 Airline Satisfaction Analytics \u00b7 Model AUC 0.9423"
+    }
+  ]
+}
