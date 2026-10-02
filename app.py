@@ -71,12 +71,29 @@ def retrieve(query, top_k=6):
     return ranked[:top_k]
 
 def verify_numbers(answer, context):
-    """Return list of data-like numbers in answer that don't appear in context.
-    Ignores bare integers (which are usually citations/rule numbers)."""
+    """Return data-like numbers in answer not in context (with 5% rounding tolerance)."""
     pattern = r'\b\d+\.\d+\b|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b'
-    nums_in_answer = re.findall(pattern, answer)
-    ctx_nums = set(re.findall(pattern, context))
-    unverified = [n for n in nums_in_answer if n not in ctx_nums]
+    answer_nums = re.findall(pattern, answer)
+    ctx_raw = re.findall(pattern, context)
+    ctx_nums = []
+    for n in ctx_raw:
+        try:
+            ctx_nums.append(float(n.replace(',', '')))
+        except ValueError:
+            continue
+    unverified = []
+    for n_str in answer_nums:
+        try:
+            n = float(n_str.replace(',', ''))
+        except ValueError:
+            continue
+        # Skip tiny numbers — they're usually references, not data
+        if n < 1 and '.' not in n_str:
+            continue
+        # Consider verified if within 5% of any context number
+        if any(abs(n - c) / max(abs(c), 1e-9) < 0.05 for c in ctx_nums):
+            continue
+        unverified.append(n_str)
     return unverified
 
 
