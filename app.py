@@ -1,17 +1,10 @@
 """
-Airline Satisfaction RAG — app.py (v2.1 final)
+Airline Satisfaction RAG — app.py (v2.2 final)
 
-Bug fixes vs your earlier version (all observed in your transcripts):
-
-  #1  Citation chaos (【1】, 【1†L1-L4】, (Source: X))       → normalized to [Title]
-  #2  Context pipes (|) breaking LLM tables                 → sanitized to ¦
-  #3  max_tokens=700 truncating answers mid-sentence        → raised to 1500
-  #4  No conversation history (follow-ups failed)           → last 2 turns passed
-  #5  Chart requests burning tokens, cutting off            → short-circuit 1 sentence
-  #6  Typo queries ("limittion", "limitaisons") refused     → fuzzy intent matching
-  #7  Detected-intent chunks not guaranteed in top-k        → force-include swap
-  #8  Gate refusing legit queries with typo                 → only gate when NO hint AND low sim
-  #9  Greetings ("hi", "hey") would be refused by gate      → greeting short-circuit
+Bug fixes vs v2.1 (from latest transcript "what the hell"):
+  #A  Stopwords triggering fuzzy intent matches     → STOPWORDS filter + length guard
+  #B  "top raw similarity" showing wrong number      → pass true raw_max through
+  #C  Sources shown on trivial redirects             → return [] when gate refuses
 """
 import re
 import json
@@ -29,16 +22,29 @@ st.set_page_config(page_title="Airline Satisfaction RAG", page_icon="🛫", layo
 GROQ_API_KEY  = st.secrets["GROQ_API_KEY"]
 MODEL         = "openai/gpt-oss-20b"
 TOP_K         = 6
-MAX_TOKENS    = 1500        # was 700 — no more mid-sentence truncation
-MIN_RAW_SIM   = 0.20        # gate threshold (only applies when no intent hint fires)
-NUMBER_TOL    = 0.005       # 0.5% tolerance for number verification
-HISTORY_TURNS = 2           # conversation turns sent to the LLM
+MAX_TOKENS    = 1500
+MIN_RAW_SIM   = 0.20
+NUMBER_TOL    = 0.005
+HISTORY_TURNS = 2
 
 CHART_KEYWORDS = (
     "chart", "plot", "graph", "visuali", "draw ", "render image",
     "bar plot", "line plot", "pie chart", "histogram", "scatter",
 )
 GREETING_TOKENS = {"hi", "hello", "hey", "greetings", "yo", "howdy"}
+
+# ── Stopwords: never used for fuzzy intent matching ───────────────────────
+STOPWORDS = set("""
+a an the of in on at to for with by from as and or but if then else so not no yes
+all any some more most very just only too also than about into over under
+what when where which who why how this that these those there here
+is are was were be been being am
+have has had having do does did doing done
+will would can could should may might must shall
+i you he she it we they me him her us them my your his its our their
+okay ok sure fine please thanks thank
+hell heck damn
+""".split())
 
 # ─────────────────────────────────────────────────────────────────────────
 # Backend
@@ -70,7 +76,7 @@ SYSTEM_PROMPT = """You are a senior data science consultant for an airline passe
 ## GROUNDING
 - Use ONLY facts from CONTEXT.
 - If the answer is not in CONTEXT: reply exactly "The provided model artifacts do not contain this information."
-- Off-topic (math, general knowledge, people, code, news, chit-chat): ONE sentence redirecting to model topics. Nothing else.
+- Off-topic (math, general knowledge, people, code, news, chit-chat, frustration): ONE sentence redirecting to model topics. Nothing else.
 
 ## NUMBERS
 - Quote exact values. Never round, never estimate, never substitute.
@@ -95,16 +101,16 @@ USER QUESTION: {question}
 Grounded answer with [Title] citations:"""
 
 # ─────────────────────────────────────────────────────────────────────────
-# Intent detection (fuzzy — catches typos)
+# Intent detection
 # ─────────────────────────────────────────────────────────────────────────
 INTENT_KEYWORDS = {
     "caveats":            ["limitation", "caveat", "constraint", "risk", "weakness",
                            "problem", "shortcoming", "drawback", "flaw", "warning",
                            "not causal", "cannot", "can't"],
     "business_levers":    ["lever", "priority", "prioritize", "impact", "what-if",
-                           "what if", "improve", "action", "investment"],
-    "segments":           ["segment", "cohort", "class", "business traveler",
-                           "personal", "loyal", "demographic"],
+                           "improve", "action", "investment"],
+    "segments":           ["segment", "cohort", "business traveler",
+                           "personal", "loyal", "demographic", "cabin"],
     "model_summary":      ["auc", "accuracy", "performance", "score", "brier",
                            "reliable", "test set", "train set", "dataset", "rows",
                            "records", "sample", "training"],
@@ -117,12 +123,19 @@ INTENT_KEYWORDS = {
 }
 
 def _fuzzy_match(token: str, keyword: str) -> bool:
-    """4-char prefix OR SequenceMatcher ≥ 0.65 — catches 'limittion' → 'limitation'."""
-    if len(token) < 4:
+    """Match with stopword filter and length guard."""
+    if token in STOPWORDS or len(token) < 4:
         return False
-    if keyword.startswith(token[:4]) or token.startswith(keyword[:4]):
+    if abs(len(token) - len(keyword)) > 3:
+        return False
+    if token == keyword:
         return True
-    return difflib.SequenceMatcher(None, token, keyword).ratio() >= 0.65
+    # Prefix match only when the token is roughly the same length
+    if keyword.startswith(token) and len(token) >= len(keyword) - 2:
+        return True
+    if token.startswith(keyword) and len(keyword) >= len(token) - 2:
+        return True
+    return difflib.SequenceMatcher(None, token, keyword).ratio() >= 0.72
 
 def detect_intents(query: str) -> set:
     q = query.lower()
@@ -130,6 +143,13 @@ def detect_intents(query: str) -> set:
     hints = set()
     for ctype, kws in INTENT_KEYWORDS.items():
         for kw in kws:
+            # Multi-word keywords: exact substring only
+            if " " in kw or "-" in kw:
+                if kw in q:
+                    hints.add(ctype)
+                    break
+                continue
+            # Single-word keywords: substring OR fuzzy token
             if kw in q or any(_fuzzy_match(t, kw) for t in tokens):
                 hints.add(ctype)
                 break
@@ -139,15 +159,13 @@ def detect_intents(query: str) -> set:
 # Post-processing helpers
 # ─────────────────────────────────────────────────────────────────────────
 def sanitize_context(text: str) -> str:
-    """Replace markdown-significant pipes so tables in context don't leak into output."""
     return text.replace("|", "¦")
 
 def normalize_citations(text: str) -> str:
-    """Force every citation to [Title] form."""
-    text = re.sub(r"†L\d+(?:-L\d+)?", "", text)                    # kill †L1-L4
-    text = text.replace("【", "[").replace("】", "]")              # CJK → ASCII
-    text = re.sub(r"\[\s*(?:ref)?\s*\d+(?:\s*[,;]\s*\d+)*\s*\]", "", text)  # [1], [1,2]
-    text = re.sub(r"\(Source:\s*([^)]+)\)", r"[\1]", text)         # (Source: X) → [X]
+    text = re.sub(r"†L\d+(?:-L\d+)?", "", text)
+    text = text.replace("【", "[").replace("】", "]")
+    text = re.sub(r"\[\s*(?:ref)?\s*\d+(?:\s*[,;]\s*\d+)*\s*\]", "", text)
+    text = re.sub(r"\(Source:\s*([^)]+)\)", r"[\1]", text)
     text = re.sub(r"\[\s*\]", "", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -165,9 +183,7 @@ def is_greeting(question: str) -> bool:
         return True
     filler = GREETING_TOKENS | {"there", "ya", "you", "how", "are", "doing",
                                  "good", "morning", "evening", "afternoon"}
-    if len(tokens) <= 3 and set(tokens) <= filler:
-        return True
-    return False
+    return len(tokens) <= 3 and set(tokens) <= filler
 
 def verify_numbers(answer: str, context: str, tol: float = NUMBER_TOL) -> list:
     clean = re.sub(r"\[[^\]]*\]", "", answer)
@@ -214,7 +230,7 @@ def retrieve(query: str, top_k: int = TOP_K):
 
     top_idx = list(np.argsort(sims)[::-1][:top_k])
 
-    # Force-include: guarantee one chunk per detected intent type
+    # Force-include one chunk per detected intent type
     for ctype in hints:
         top_types = {CHUNKS[i]["type"] for i in top_idx}
         if ctype in top_types:
@@ -223,8 +239,7 @@ def retrieve(query: str, top_k: int = TOP_K):
                      if c["type"] == ctype and i not in top_idx]
         if not type_hits:
             continue
-        best_i  = int(max(type_hits, key=lambda x: x[1])[0])
-        worst_i = top_idx[-1]
+        best_i = int(max(type_hits, key=lambda x: x[1])[0])
         top_idx = sorted(top_idx[:-1] + [best_i], key=lambda i: -sims[i])
 
     results = [{
@@ -238,31 +253,28 @@ def retrieve(query: str, top_k: int = TOP_K):
     return results, raw_max, hints
 
 # ─────────────────────────────────────────────────────────────────────────
-# Core ask
+# Core ask — returns (answer, retrieved, raw_max)
 # ─────────────────────────────────────────────────────────────────────────
 def ask(question: str, history=None, max_tokens: int = MAX_TOKENS):
     if history is None:
         history = []
 
-    # Short-circuit: charts
     if is_chart_request(question):
         return ("I can't render charts directly, but I can give you the exact numbers "
                 "to plot. Ask me for e.g. 'give me the what-if data as a table' or "
-                "'give me segment satisfaction as a table'.", [])
+                "'give me segment satisfaction as a table'.", [], 0.0)
 
-    # Short-circuit: greetings
     if is_greeting(question):
-        return ("Ready to answer questions about the satisfaction model.", [])
+        return ("Ready to answer questions about the satisfaction model.", [], 0.0)
 
-    # Short-circuit: no letters at all (e.g., "/??", "2+2")
     if not re.search(r"[a-zA-Z]", question):
-        return ("The provided model artifacts do not contain this information.", [])
+        return ("The provided model artifacts do not contain this information.", [], 0.0)
 
     retrieved, raw_max, hints = retrieve(question)
 
-    # Gate: refuse only when NO intent hint AND low raw similarity
+    # Gate: refuse when no intent AND low raw similarity — hide sources for clean UX
     if not hints and raw_max < MIN_RAW_SIM:
-        return ("The provided model artifacts do not contain this information.", retrieved)
+        return ("The provided model artifacts do not contain this information.", [], raw_max)
 
     context = "\n\n".join(
         f"[{c['title']}]\n{sanitize_context(c['text'])}" for c in retrieved
@@ -285,7 +297,7 @@ def ask(question: str, history=None, max_tokens: int = MAX_TOKENS):
         )
         answer = resp.choices[0].message.content or ""
     except Exception as e:
-        return (f"LLM error: {e}", retrieved)
+        return (f"LLM error: {e}", retrieved, raw_max)
 
     answer = normalize_citations(answer)
 
@@ -294,7 +306,7 @@ def ask(question: str, history=None, max_tokens: int = MAX_TOKENS):
         answer += ("\n\n_⚠️ Could not verify against retrieved sources: "
                    + ", ".join(sorted(set(unverified))) + "_")
 
-    return answer, retrieved
+    return answer, retrieved, raw_max
 
 # ─────────────────────────────────────────────────────────────────────────
 # UI
@@ -335,7 +347,6 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 def process(q: str):
-    # Capture history BEFORE appending the new user message
     history = st.session_state.messages[-2 * HISTORY_TURNS:] if st.session_state.messages else []
 
     st.session_state.messages.append({"role": "user", "content": q})
@@ -344,11 +355,10 @@ def process(q: str):
 
     with st.chat_message("assistant"):
         with st.spinner("Searching corpus..."):
-            answer, retrieved = ask(q, history=history)
+            answer, retrieved, raw_max = ask(q, history=history)
         st.markdown(answer)
         if retrieved:
-            top_raw = retrieved[0].get("raw_score", retrieved[0]["score"])
-            with st.expander(f"Sources ({len(retrieved)}) — top raw similarity {top_raw:.3f}"):
+            with st.expander(f"Sources ({len(retrieved)}) — top raw similarity {raw_max:.3f}"):
                 for c in retrieved:
                     st.markdown(
                         f"**{c['title']}** (`{c['type']}`) — "
