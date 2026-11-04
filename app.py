@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 
 # =============================================================================
-# CONFIG & SAFETY CHECKS (Prevents blank white screen)
+# CONFIG & SAFETY CHECKS
 # =============================================================================
 st.set_page_config(page_title="Airline Satisfaction RAG", page_icon="🛫", layout="wide")
 
@@ -157,7 +157,7 @@ USER QUESTION: {question}
 Grounded answer with [Title] citations:"""
 
 # =============================================================================
-# INTENT DETECTION
+# INTENT DETECTION & HELPERS
 # =============================================================================
 INTENT_KEYWORDS = {
     "caveats":            ["limitation", "caveat", "constraint", "risk", "weakness",
@@ -239,9 +239,15 @@ def is_greeting(question: str) -> bool:
                                  "good", "morning", "evening", "afternoon"}
     return len(tokens) <= 3 and set(tokens) <= filler
 
-# =============================================================================
-# POST-PROCESSING HELPERS
-# =============================================================================
+def is_latency_complaint(question: str) -> bool:
+    q = question.lower()
+    triggers = [
+        "why taking so long", "why so long", "why you taking so long", 
+        "why are you slow", "slow to answer", "slow response", 
+        "why so slow", "takes too long"
+    ]
+    return any(t in q for t in triggers)
+
 def sanitize_context(text: str) -> str:
     return text.replace("|", "\u00a6")
 
@@ -289,7 +295,7 @@ def verify_numbers(answer: str, context: str, tol: float = NUMBER_TOL) -> list:
     return unverified
 
 # =============================================================================
-# RETRIEVAL
+# RETRIEVAL & CORE ASK
 # =============================================================================
 def retrieve(query: str, top_k: int = TOP_K):
     q_emb = embedder.encode([query], convert_to_numpy=True)[0]
@@ -349,12 +355,13 @@ def build_search_query(question: str, history: list) -> str:
         return question
     return f"{last_user_q} {question}"
 
-# =============================================================================
-# CORE ASK
-# =============================================================================
 def ask(question: str, history=None, max_tokens: int = MAX_TOKENS):
     if history is None:
         history = []
+
+    if is_latency_complaint(question):
+        return ("I apologize for the delay! I am an API-driven chatbot retrieving pre-computed artifacts. "
+                "I do not train the model in real-time; any slowness is network or API latency.", [], 0.0)
 
     if is_chart_request(question):
         return ("I can't render charts directly, but I can give you the exact numbers "
