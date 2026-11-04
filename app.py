@@ -1,10 +1,10 @@
 """
-Airline Satisfaction RAG — app.py (v2.2 final)
+Airline Satisfaction RAG — app.py (v2.3 final)
 
-Bug fixes vs v2.1 (from latest transcript "what the hell"):
-  #A  Stopwords triggering fuzzy intent matches     → STOPWORDS filter + length guard
-  #B  "top raw similarity" showing wrong number      → pass true raw_max through
-  #C  Sources shown on trivial redirects             → return [] when gate refuses
+Bug fixes vs v2.2 (from "NPS / insurance / which domain" transcript):
+  #D  Applicability questions ("can this apply to X?") refusing coldly   → new prompt rule + intent hint
+  #E  Fragmented follow-ups ("which domain?") refused by gate           → history-aware retrieval
+  #F  Gate too strict when history contains a substantive question       → bypass gate if history is relevant
 """
 import re
 import json
@@ -26,6 +26,7 @@ MAX_TOKENS    = 1500
 MIN_RAW_SIM   = 0.20
 NUMBER_TOL    = 0.005
 HISTORY_TURNS = 2
+AMBIGUOUS_MAX_TOKENS = 6   # queries shorter than this use history-expanded retrieval
 
 CHART_KEYWORDS = (
     "chart", "plot", "graph", "visuali", "draw ", "render image",
@@ -33,7 +34,16 @@ CHART_KEYWORDS = (
 )
 GREETING_TOKENS = {"hi", "hello", "hey", "greetings", "yo", "howdy"}
 
-# ── Stopwords: never used for fuzzy intent matching ───────────────────────
+# Applicability / transferability intent — the model should answer these with
+# a "not in artifacts, but approach transfers" pattern instead of raw refusal.
+APPLICABILITY_KEYWORDS = [
+    "apply to", "applied to", "reuse", "reusable", "transfer",
+    "other domain", "other industr", "different domain", "different industr",
+    "insurance", "healthcare", "banking", "retail", "telecom", "e-commerce",
+    "can it work for", "could it work for", "generalize", "generaliz",
+    "use case", "use-case", "not airline", "non-airline",
+]
+
 STOPWORDS = set("""
 a an the of in on at to for with by from as and or but if then else so not no yes
 all any some more most very just only too also than about into over under
@@ -74,9 +84,16 @@ SYSTEM_PROMPT = """You are a senior data science consultant for an airline passe
 - NEVER repeat the question.
 
 ## GROUNDING
-- Use ONLY facts from CONTEXT.
-- If the answer is not in CONTEXT: reply exactly "The provided model artifacts do not contain this information."
+- Use ONLY facts from CONTEXT for claims about THIS model.
+- If a factual question about this model is not in CONTEXT: reply exactly "The provided model artifacts do not contain this information."
 - Off-topic (math, general knowledge, people, code, news, chit-chat, frustration): ONE sentence redirecting to model topics. Nothing else.
+
+## APPLICABILITY QUESTIONS
+- If asked whether this approach can be applied to another domain (insurance, banking, retail, etc.):
+  1. State clearly: the model was trained on airline satisfaction data; the artifacts do not cover other industries.
+  2. Note which ASPECTS of the approach are domain-agnostic: logistic regression with L2, two-model design (predictive + interpretive), SHAP for feature attribution, segment-level analysis, what-if lever prioritization, and number verification.
+  3. Do NOT claim results for other domains. Do NOT invent metrics.
+- Keep to 3–5 sentences. Cite [Model Overview] and [Methodology] where relevant.
 
 ## NUMBERS
 - Quote exact values. Never round, never estimate, never substitute.
@@ -86,6 +103,11 @@ SYSTEM_PROMPT = """You are a senior data science consultant for an airline passe
 - After each factual sentence, add ONE citation: [Chunk Title]
 - CORRECT: [Model Overview]   [Top 10 SHAP Drivers]   [What-If Business Lever Analysis]
 - FORBIDDEN: 【...】 brackets, 【1†L1-L4】, "(Source: X)" — use ONLY [Title]
+
+## CONVERSATION CONTEXT
+- The user's previous turn is included above.
+- Resolve pronouns and fragments ("which domain?", "how reliable is that?") using prior turns.
+- If the current question is a fragment, answer the resolved question, not the literal fragment.
 
 ## CAPABILITY BOUNDARIES
 - You CANNOT draw, render, or produce charts, plots, images, files.
@@ -123,14 +145,12 @@ INTENT_KEYWORDS = {
 }
 
 def _fuzzy_match(token: str, keyword: str) -> bool:
-    """Match with stopword filter and length guard."""
     if token in STOPWORDS or len(token) < 4:
         return False
     if abs(len(token) - len(keyword)) > 3:
         return False
     if token == keyword:
         return True
-    # Prefix match only when the token is roughly the same length
     if keyword.startswith(token) and len(token) >= len(keyword) - 2:
         return True
     if token.startswith(keyword) and len(keyword) >= len(token) - 2:
@@ -143,17 +163,33 @@ def detect_intents(query: str) -> set:
     hints = set()
     for ctype, kws in INTENT_KEYWORDS.items():
         for kw in kws:
-            # Multi-word keywords: exact substring only
             if " " in kw or "-" in kw:
                 if kw in q:
                     hints.add(ctype)
                     break
                 continue
-            # Single-word keywords: substring OR fuzzy token
             if kw in q or any(_fuzzy_match(t, kw) for t in tokens):
                 hints.add(ctype)
                 break
     return hints
+
+def is_applicability_question(query: str) -> bool:
+    q = query.lower()
+    return any(kw in q for kw in APPLICABILITY_KEYWORDS)
+
+def is_chart_request(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in CHART_KEYWORDS)
+
+def is_greeting(question: str) -> bool:
+    tokens = re.findall(r"[a-z]+", question.lower())
+    if not tokens:
+        return False
+    if set(tokens) <= GREETING_TOKENS:
+        return True
+    filler = GREETING_TOKENS | {"there", "ya", "you", "how", "are", "doing",
+                                 "good", "morning", "evening", "afternoon"}
+    return len(tokens) <= 3 and set(tokens) <= filler
 
 # ─────────────────────────────────────────────────────────────────────────
 # Post-processing helpers
@@ -170,20 +206,6 @@ def normalize_citations(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
-def is_chart_request(question: str) -> bool:
-    q = question.lower()
-    return any(kw in q for kw in CHART_KEYWORDS)
-
-def is_greeting(question: str) -> bool:
-    tokens = re.findall(r"[a-z]+", question.lower())
-    if not tokens:
-        return False
-    if set(tokens) <= GREETING_TOKENS:
-        return True
-    filler = GREETING_TOKENS | {"there", "ya", "you", "how", "are", "doing",
-                                 "good", "morning", "evening", "afternoon"}
-    return len(tokens) <= 3 and set(tokens) <= filler
 
 def verify_numbers(answer: str, context: str, tol: float = NUMBER_TOL) -> list:
     clean = re.sub(r"\[[^\]]*\]", "", answer)
@@ -222,6 +244,10 @@ def retrieve(query: str, top_k: int = TOP_K):
     sims  = raw_sims.copy()
     hints = detect_intents(query)
 
+    # Applicability questions benefit from methodology + model_card context
+    if is_applicability_question(query):
+        hints.update(["methodology", "model_summary"])
+
     for i, c in enumerate(CHUNKS):
         if c["type"] in hints:
             sims[i] += 0.20
@@ -230,7 +256,6 @@ def retrieve(query: str, top_k: int = TOP_K):
 
     top_idx = list(np.argsort(sims)[::-1][:top_k])
 
-    # Force-include one chunk per detected intent type
     for ctype in hints:
         top_types = {CHUNKS[i]["type"] for i in top_idx}
         if ctype in top_types:
@@ -252,6 +277,25 @@ def retrieve(query: str, top_k: int = TOP_K):
     } for i in top_idx]
     return results, raw_max, hints
 
+def build_search_query(question: str, history: list) -> str:
+    """Expand short/ambiguous follow-ups using the last user turn."""
+    if not history:
+        return question
+    tokens = re.findall(r"[a-z]+", question.lower())
+    is_short = len(tokens) <= AMBIGUOUS_MAX_TOKENS
+    has_hint = bool(detect_intents(question))
+    if not (is_short or not has_hint):
+        return question
+    # Grab last user question from history (roles: user / assistant alternating)
+    last_user_q = None
+    for m in reversed(history):
+        if m["role"] == "user":
+            last_user_q = m["content"]
+            break
+    if not last_user_q:
+        return question
+    return f"{last_user_q} {question}"
+
 # ─────────────────────────────────────────────────────────────────────────
 # Core ask — returns (answer, retrieved, raw_max)
 # ─────────────────────────────────────────────────────────────────────────
@@ -270,10 +314,23 @@ def ask(question: str, history=None, max_tokens: int = MAX_TOKENS):
     if not re.search(r"[a-zA-Z]", question):
         return ("The provided model artifacts do not contain this information.", [], 0.0)
 
-    retrieved, raw_max, hints = retrieve(question)
+    search_q = build_search_query(question, history)
+    retrieved, raw_max, hints = retrieve(search_q)
 
-    # Gate: refuse when no intent AND low raw similarity — hide sources for clean UX
-    if not hints and raw_max < MIN_RAW_SIM:
+    # Applicability questions are always allowed through (they use prompt rule)
+    applicability = is_applicability_question(question) or is_applicability_question(search_q)
+
+    # History-aware gate:
+    # - If there's substantive conversation history, don't gate on raw similarity alone.
+    # - Applicability questions are never gated.
+    has_substantive_history = any(
+        m["role"] == "user" and len(m["content"].split()) >= 3 for m in history
+    )
+
+    if (not applicability
+        and not hints
+        and not has_substantive_history
+        and raw_max < MIN_RAW_SIM):
         return ("The provided model artifacts do not contain this information.", [], raw_max)
 
     context = "\n\n".join(
@@ -334,6 +391,7 @@ with st.sidebar:
         "What should the airline do to improve satisfaction?",
         "Is Age a driver of satisfaction?",
         "What is the test set size?",
+        "Can this approach apply to insurance NPS?",
     ]
     for q in sample_qs:
         if st.button(q, use_container_width=True):
