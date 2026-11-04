@@ -128,3 +128,4 @@ SYSTEM_PROMPT = """You are a senior data science consultant for an airline passe
 
 ## EQUATIONS
 - Write equations as ASCII inside a fenced code block:
+"""
