@@ -1,47 +1,52 @@
 """
-Airline Satisfaction RAG — app.py (v2)
+Airline Satisfaction RAG — app.py (v2.1 final)
 
-Fixes in this version:
-  1. Citation normalization  — 【1】, 【1†L1-L4】, (Source: X) → [Title]
-  2. Context sanitization    — pipes in context no longer break LLM tables
-  3. Conversation memory     — last 2 turns sent to the LLM
-  4. Retrieval floor         — refuses before calling LLM when raw similarity is too low
-  5. Chart pre-check         — "draw a chart" answers in 1 sentence, saves tokens
-  6. Token budget            — 700 → 1500, no more mid-sentence truncation
-  7. Concise style rules     — default 2–4 sentences, tables only on request
+Bug fixes vs your earlier version (all observed in your transcripts):
+
+  #1  Citation chaos (【1】, 【1†L1-L4】, (Source: X))       → normalized to [Title]
+  #2  Context pipes (|) breaking LLM tables                 → sanitized to ¦
+  #3  max_tokens=700 truncating answers mid-sentence        → raised to 1500
+  #4  No conversation history (follow-ups failed)           → last 2 turns passed
+  #5  Chart requests burning tokens, cutting off            → short-circuit 1 sentence
+  #6  Typo queries ("limittion", "limitaisons") refused     → fuzzy intent matching
+  #7  Detected-intent chunks not guaranteed in top-k        → force-include swap
+  #8  Gate refusing legit queries with typo                 → only gate when NO hint AND low sim
+  #9  Greetings ("hi", "hey") would be refused by gate      → greeting short-circuit
 """
 import re
 import json
+import difflib
 import numpy as np
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
 # Config
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Airline Satisfaction RAG", page_icon="🛫", layout="wide")
 
-GROQ_API_KEY   = st.secrets["GROQ_API_KEY"]
-MODEL          = "openai/gpt-oss-20b"
-TOP_K          = 6
-MAX_TOKENS     = 1500          # was 700 — prevents mid-sentence truncation
-MIN_RAW_SIM    = 0.20          # refusal threshold (tune on your golden set)
-NUMBER_TOL     = 0.005         # 0.5% tolerance when verifying numbers
-HISTORY_TURNS  = 2             # conversation turns sent to LLM
+GROQ_API_KEY  = st.secrets["GROQ_API_KEY"]
+MODEL         = "openai/gpt-oss-20b"
+TOP_K         = 6
+MAX_TOKENS    = 1500        # was 700 — no more mid-sentence truncation
+MIN_RAW_SIM   = 0.20        # gate threshold (only applies when no intent hint fires)
+NUMBER_TOL    = 0.005       # 0.5% tolerance for number verification
+HISTORY_TURNS = 2           # conversation turns sent to the LLM
 
 CHART_KEYWORDS = (
     "chart", "plot", "graph", "visuali", "draw ", "render image",
     "bar plot", "line plot", "pie chart", "histogram", "scatter",
 )
+GREETING_TOKENS = {"hi", "hello", "hey", "greetings", "yo", "howdy"}
 
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
 # Backend
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_backend():
-    embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    embeddings = np.load("./embeddings/embeddings.npy")
+    embedder    = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    embeddings  = np.load("./embeddings/embeddings.npy")
     with open("./embeddings/chunks.json") as f:
         chunks = json.load(f)
     groq_client = Groq(api_key=GROQ_API_KEY)
@@ -50,41 +55,36 @@ def load_backend():
 embedder, EMBEDDINGS, CHUNKS, groq_client = load_backend()
 EMBEDDINGS_NORM = EMBEDDINGS / (np.linalg.norm(EMBEDDINGS, axis=1, keepdims=True) + 1e-9)
 
-# ----------------------------------------------------------------------------
-# Prompts
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
+# System prompt
+# ─────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a senior data science consultant for an airline passenger satisfaction model.
 
 ## STYLE
-- DEFAULT: answer in 2–4 sentences. Direct answer first. No preamble, no greeting.
-- Bullet list ONLY when user asks for "list", "prioritize", "all", or "compare".
+- DEFAULT: 2–4 sentences. Direct answer first. No preamble, no greeting.
+- Bullet list ONLY when user asks for "list", "prioritize", "all", "compare".
 - Markdown table ONLY when user asks for "table" or "compare".
 - NEVER exceed 120 words unless the user explicitly asks for "full summary" or "everything".
-- NEVER repeat the question back.
+- NEVER repeat the question.
 
 ## GROUNDING
 - Use ONLY facts from CONTEXT.
 - If the answer is not in CONTEXT: reply exactly "The provided model artifacts do not contain this information."
-- If the question is off-topic (math, general knowledge, people, code, news, chit-chat): reply in ONE sentence redirecting to model topics. Nothing else.
+- Off-topic (math, general knowledge, people, code, news, chit-chat): ONE sentence redirecting to model topics. Nothing else.
 
 ## NUMBERS
-- Quote exact values from CONTEXT. Never round, never estimate, never substitute.
-- If CONTEXT shows "+5.02", write "+5.02" — not "+5.0", not "+4.99", not "about 5".
+- Quote exact values. Never round, never estimate, never substitute.
+- If CONTEXT shows "+5.02", write "+5.02" — not "+5.0", not "about 5".
 
 ## CITATIONS — STRICT FORMAT
 - After each factual sentence, add ONE citation: [Chunk Title]
 - CORRECT: [Model Overview]   [Top 10 SHAP Drivers]   [What-If Business Lever Analysis]
-- FORBIDDEN: 【...】 brackets, 【1†L1-L4】, "(Source: X)", anything except [Title]
-- If multiple sources support one sentence: [Model Overview; Segment-Level Satisfaction]
+- FORBIDDEN: 【...】 brackets, 【1†L1-L4】, "(Source: X)" — use ONLY [Title]
 
 ## CAPABILITY BOUNDARIES
-- You CANNOT draw, render, or produce charts, plots, images, or files.
-- If asked for a chart: ONE sentence saying so, then offer the numbers as a table if useful.
-- You CANNOT answer general knowledge, math, code, or news.
-
-## AMBIGUOUS QUERIES
-- If user says a greeting ("hey", "hello", "hi"): reply ONE sentence: "Ready to answer questions about the satisfaction model." Nothing else.
-- If user asks "what do you know?" or similar open-ended question: give EXACTLY 5 bullets, each ≤15 words, each with a [source]. Then ask "Which area should I expand?"
+- You CANNOT draw, render, or produce charts, plots, images, files.
+- If asked for a chart: ONE sentence saying so, then optionally offer the data as a table.
+- You CANNOT answer general knowledge, math, code, news.
 """
 
 USER_TEMPLATE = """CONTEXT CHUNKS:
@@ -94,24 +94,60 @@ USER QUESTION: {question}
 
 Grounded answer with [Title] citations:"""
 
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
+# Intent detection (fuzzy — catches typos)
+# ─────────────────────────────────────────────────────────────────────────
+INTENT_KEYWORDS = {
+    "caveats":            ["limitation", "caveat", "constraint", "risk", "weakness",
+                           "problem", "shortcoming", "drawback", "flaw", "warning",
+                           "not causal", "cannot", "can't"],
+    "business_levers":    ["lever", "priority", "prioritize", "impact", "what-if",
+                           "what if", "improve", "action", "investment"],
+    "segments":           ["segment", "cohort", "class", "business traveler",
+                           "personal", "loyal", "demographic"],
+    "model_summary":      ["auc", "accuracy", "performance", "score", "brier",
+                           "reliable", "test set", "train set", "dataset", "rows",
+                           "records", "sample", "training"],
+    "methodology":        ["method", "trained", "built", "approach", "feature",
+                           "halo", "collinear", "imput", "bootstrap",
+                           "cross-validation", "two models"],
+    "feature_importance": ["shap", "importance", "driver"],
+    "coefficients":       ["coefficient", "odds ratio", "odds"],
+    "recommendations":    ["recommend", "suggest", "should we", "what to do"],
+}
+
+def _fuzzy_match(token: str, keyword: str) -> bool:
+    """4-char prefix OR SequenceMatcher ≥ 0.65 — catches 'limittion' → 'limitation'."""
+    if len(token) < 4:
+        return False
+    if keyword.startswith(token[:4]) or token.startswith(keyword[:4]):
+        return True
+    return difflib.SequenceMatcher(None, token, keyword).ratio() >= 0.65
+
+def detect_intents(query: str) -> set:
+    q = query.lower()
+    tokens = re.findall(r"[a-z]+", q)
+    hints = set()
+    for ctype, kws in INTENT_KEYWORDS.items():
+        for kw in kws:
+            if kw in q or any(_fuzzy_match(t, kw) for t in tokens):
+                hints.add(ctype)
+                break
+    return hints
+
+# ─────────────────────────────────────────────────────────────────────────
+# Post-processing helpers
+# ─────────────────────────────────────────────────────────────────────────
 def sanitize_context(text: str) -> str:
     """Replace markdown-significant pipes so tables in context don't leak into output."""
     return text.replace("|", "¦")
 
 def normalize_citations(text: str) -> str:
-    """Collapse model-invented citation formats into a single [Title] convention."""
-    # Kill the †L1-L4 token noise (academic PDF-style artifacts)
-    text = re.sub(r"†L\d+(?:-L\d+)?", "", text)
-    # CJK brackets → ASCII
-    text = text.replace("【", "[").replace("】", "]")
-    # Strip bare numeric citations: [1], [1, 2], [ref1]
-    text = re.sub(r"\[\s*(?:ref)?\s*\d+(?:\s*[,;]\s*\d+)*\s*\]", "", text)
-    # "(Source: X)" → "[X]"
-    text = re.sub(r"\(Source:\s*([^)]+)\)", r"[\1]", text)
-    # Cleanup leftovers
+    """Force every citation to [Title] form."""
+    text = re.sub(r"†L\d+(?:-L\d+)?", "", text)                    # kill †L1-L4
+    text = text.replace("【", "[").replace("】", "]")              # CJK → ASCII
+    text = re.sub(r"\[\s*(?:ref)?\s*\d+(?:\s*[,;]\s*\d+)*\s*\]", "", text)  # [1], [1,2]
+    text = re.sub(r"\(Source:\s*([^)]+)\)", r"[\1]", text)         # (Source: X) → [X]
     text = re.sub(r"\[\s*\]", "", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -121,54 +157,20 @@ def is_chart_request(question: str) -> bool:
     q = question.lower()
     return any(kw in q for kw in CHART_KEYWORDS)
 
-def retrieve(query: str, top_k: int = TOP_K):
-    """Returns (ranked results, raw_max_similarity)."""
-    q_emb = embedder.encode([query], convert_to_numpy=True)[0]
-    q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-9)
-    raw_sims = EMBEDDINGS_NORM @ q_emb
-    raw_max = float(np.max(raw_sims))
+def is_greeting(question: str) -> bool:
+    tokens = re.findall(r"[a-z]+", question.lower())
+    if not tokens:
+        return False
+    if set(tokens) <= GREETING_TOKENS:
+        return True
+    filler = GREETING_TOKENS | {"there", "ya", "you", "how", "are", "doing",
+                                 "good", "morning", "evening", "afternoon"}
+    if len(tokens) <= 3 and set(tokens) <= filler:
+        return True
+    return False
 
-    sims = raw_sims.copy()
-    q = query.lower()
-    hints = set()
-    if any(w in q for w in ["limitation","caveat","constraint","risk","weakness","problem"]):
-        hints.add("caveats")
-    if any(w in q for w in ["lever","priorit","impact","what-if","improve","recommend"]):
-        hints.update(["business_levers", "recommendations"])
-    if any(w in q for w in ["segment","cohort","class","business traveler","personal","loyal"]):
-        hints.add("segments")
-    if any(w in q for w in ["auc","accuracy","performance","score","brier","reliable"]):
-        hints.add("model_summary")
-    if any(w in q for w in ["method","how","trained","built","approach","feature",
-                            "halo","collinear","imput","bootstrap","two models"]):
-        hints.update(["methodology", "model_summary"])
-    if any(w in q for w in ["shap","importance","driver"]):
-        hints.add("feature_importance")
-    if any(w in q for w in ["coefficient","odds ratio","odds"]):
-        hints.update(["coefficients", "coefficient_detail"])
-    if any(w in q for w in ["test set","train set","dataset","rows","records","sample"]):
-        hints.add("model_summary")
-
-    for i, c in enumerate(CHUNKS):
-        if c["type"] in hints:
-            sims[i] += 0.20
-        if c["type"] == "report_page":
-            sims[i] -= 0.15
-
-    top_idx = np.argsort(sims)[::-1][:top_k]
-    results = [{
-        "id":         CHUNKS[i]["id"],
-        "type":       CHUNKS[i]["type"],
-        "title":      CHUNKS[i]["title"],
-        "text":       CHUNKS[i]["text"],
-        "score":      float(sims[i]),
-        "raw_score":  float(raw_sims[i]),
-    } for i in top_idx]
-    return results, raw_max
-
-def verify_numbers(answer: str, context: str, tol: float = NUMBER_TOL):
-    """Return decimal/thousands-formatted numbers in answer that don't match context."""
-    clean = re.sub(r"\[[^\]]*\]", "", answer)   # ignore citation brackets
+def verify_numbers(answer: str, context: str, tol: float = NUMBER_TOL) -> list:
+    clean = re.sub(r"\[[^\]]*\]", "", answer)
     pattern = r"[+-]?\d+\.\d+|[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
 
     def parse(nums):
@@ -192,35 +194,78 @@ def verify_numbers(answer: str, context: str, tol: float = NUMBER_TOL):
         unverified.append(n_str)
     return unverified
 
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
+# Retrieval
+# ─────────────────────────────────────────────────────────────────────────
+def retrieve(query: str, top_k: int = TOP_K):
+    q_emb = embedder.encode([query], convert_to_numpy=True)[0]
+    q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-9)
+    raw_sims = EMBEDDINGS_NORM @ q_emb
+    raw_max  = float(np.max(raw_sims))
+
+    sims  = raw_sims.copy()
+    hints = detect_intents(query)
+
+    for i, c in enumerate(CHUNKS):
+        if c["type"] in hints:
+            sims[i] += 0.20
+        if c["type"] == "report_page":
+            sims[i] -= 0.15
+
+    top_idx = list(np.argsort(sims)[::-1][:top_k])
+
+    # Force-include: guarantee one chunk per detected intent type
+    for ctype in hints:
+        top_types = {CHUNKS[i]["type"] for i in top_idx}
+        if ctype in top_types:
+            continue
+        type_hits = [(i, sims[i]) for i, c in enumerate(CHUNKS)
+                     if c["type"] == ctype and i not in top_idx]
+        if not type_hits:
+            continue
+        best_i  = int(max(type_hits, key=lambda x: x[1])[0])
+        worst_i = top_idx[-1]
+        top_idx = sorted(top_idx[:-1] + [best_i], key=lambda i: -sims[i])
+
+    results = [{
+        "id":        CHUNKS[i]["id"],
+        "type":      CHUNKS[i]["type"],
+        "title":     CHUNKS[i]["title"],
+        "text":      CHUNKS[i]["text"],
+        "score":     float(sims[i]),
+        "raw_score": float(raw_sims[i]),
+    } for i in top_idx]
+    return results, raw_max, hints
+
+# ─────────────────────────────────────────────────────────────────────────
 # Core ask
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
 def ask(question: str, history=None, max_tokens: int = MAX_TOKENS):
-    """Returns (answer_text, retrieved_chunks)."""
     if history is None:
         history = []
 
-    # Fast path: chart requests
+    # Short-circuit: charts
     if is_chart_request(question):
-        return (
-            "I can't render charts directly, but I can give you the exact numbers "
-            "to plot. Ask me for e.g. 'give me the what-if data as a table' or "
-            "'give me segment satisfaction as a table'.",
-            [],
-        )
+        return ("I can't render charts directly, but I can give you the exact numbers "
+                "to plot. Ask me for e.g. 'give me the what-if data as a table' or "
+                "'give me segment satisfaction as a table'.", [])
 
-    retrieved, raw_max = retrieve(question)
+    # Short-circuit: greetings
+    if is_greeting(question):
+        return ("Ready to answer questions about the satisfaction model.", [])
 
-    # Retrieval floor — refuse before burning LLM tokens
-    if raw_max < MIN_RAW_SIM:
-        return (
-            "The provided model artifacts do not contain this information.",
-            retrieved,
-        )
+    # Short-circuit: no letters at all (e.g., "/??", "2+2")
+    if not re.search(r"[a-zA-Z]", question):
+        return ("The provided model artifacts do not contain this information.", [])
+
+    retrieved, raw_max, hints = retrieve(question)
+
+    # Gate: refuse only when NO intent hint AND low raw similarity
+    if not hints and raw_max < MIN_RAW_SIM:
+        return ("The provided model artifacts do not contain this information.", retrieved)
 
     context = "\n\n".join(
-        f"[{c['title']}]\n{sanitize_context(c['text'])}"
-        for c in retrieved
+        f"[{c['title']}]\n{sanitize_context(c['text'])}" for c in retrieved
     )
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -246,16 +291,14 @@ def ask(question: str, history=None, max_tokens: int = MAX_TOKENS):
 
     unverified = verify_numbers(answer, context)
     if unverified:
-        answer += (
-            "\n\n_⚠️ Could not verify against retrieved sources: "
-            + ", ".join(sorted(set(unverified))) + "_"
-        )
+        answer += ("\n\n_⚠️ Could not verify against retrieved sources: "
+                   + ", ".join(sorted(set(unverified))) + "_")
 
     return answer, retrieved
 
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
 # UI
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
 st.title("🛫 Airline Satisfaction RAG")
 st.caption("Ask questions grounded in coefficients, SHAP, what-if analysis, and the executive report.")
 
@@ -292,7 +335,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 def process(q: str):
-    # History = last N turns BEFORE we append this new user msg
+    # Capture history BEFORE appending the new user message
     history = st.session_state.messages[-2 * HISTORY_TURNS:] if st.session_state.messages else []
 
     st.session_state.messages.append({"role": "user", "content": q})
@@ -305,8 +348,7 @@ def process(q: str):
         st.markdown(answer)
         if retrieved:
             top_raw = retrieved[0].get("raw_score", retrieved[0]["score"])
-            label = f"Sources ({len(retrieved)}) — top raw similarity {top_raw:.3f}"
-            with st.expander(label):
+            with st.expander(f"Sources ({len(retrieved)}) — top raw similarity {top_raw:.3f}"):
                 for c in retrieved:
                     st.markdown(
                         f"**{c['title']}** (`{c['type']}`) — "
