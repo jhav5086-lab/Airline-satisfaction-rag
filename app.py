@@ -23,15 +23,13 @@ if not os.path.exists("./embeddings/embeddings.npy") or not os.path.exists("./em
     st.error("🚨 **Missing Files:** could not find ./embeddings/ folder.")
     st.stop()
 
-# FIX 21: model fallback chain — resolved against live API at startup
 MODEL_PREFERENCES = [
     st.secrets.get("LLM_MODEL") if st.secrets.get("LLM_MODEL") else None,
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
 ]
-MODEL_PREFERENCES = [m for m in MODEL_PREFERENCES if m]  # drop None
-
+MODEL_PREFERENCES = [m for m in MODEL_PREFERENCES if m]
 EMBED_MODEL = st.secrets.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
 TOP_K = 4
@@ -51,6 +49,9 @@ SELF_CHECK_TRIGGERS = (
     "definitely", "always", "never", "guarantee", "means that", "so we should",
 )
 
+META_FOLLOWUPS = ("why", "why?", "explain", "how come", "what do you mean",
+                  "what?", "huh", "why not", "why not?", "which", "how")
+
 # =============================================================================
 # BACKEND + MODEL RESOLUTION
 # =============================================================================
@@ -65,7 +66,6 @@ def load_backend():
 
 @st.cache_resource
 def resolve_llm_model(_client, preferences: tuple):
-    """Try each preference against the live API. Return (model_id, available_models)."""
     try:
         available = {m.id for m in _client.models.list().data}
     except Exception as e:
@@ -83,14 +83,12 @@ LLM_MODEL, AVAILABLE_MODELS, MODEL_ERROR = resolve_llm_model(groq_client, tuple(
 if LLM_MODEL is None:
     st.error(f"🚨 **No usable LLM model found.** {MODEL_ERROR}")
     if AVAILABLE_MODELS:
-        st.info("Your account has these models. Pick one and set `LLM_MODEL` in secrets:\n\n" +
+        st.info("Available models — set `LLM_MODEL` in secrets:\n\n" +
                 "\n".join(f"- `{m}`" for m in AVAILABLE_MODELS))
-    else:
-        st.info("Could not query Groq model list. Check your API key at https://console.groq.com/keys")
     st.stop()
 
 # =============================================================================
-# SYSTEM PROMPT
+# SYSTEM PROMPT  (all fixes 3/4/5/6 + 2dp hints)
 # =============================================================================
 SYSTEM_PROMPT = "\n".join([
     "You are a senior data science consultant for an airline passenger satisfaction model.",
@@ -99,34 +97,38 @@ SYSTEM_PROMPT = "\n".join([
     "",
     "GROUNDING: use ONLY facts in CONTEXT. If not in CONTEXT: reply exactly 'The provided model artifacts do not contain this information.'",
     "",
-    "PUSHBACK — CRITICAL RULES:",
-    "1. Do NOT confirm a false premise just because part of it is technically true. If the user's claim is partially right and partially wrong, state clearly what IS supported and what IS NOT.",
-    "2. If the user states a number that contradicts CONTEXT, correct it with the CONTEXT value and cite it. Never compute on user-supplied numbers unless they match CONTEXT.",
-    "3. If the user asks you to 'confirm' or 'prove' something, evaluate whether the artifacts actually support it — do not assume the claim is true.",
+    "PUSHBACK — CRITICAL:",
+    "1. Do NOT confirm a false premise because part of it is technically true. State what IS supported and what IS NOT.",
+    "2. If the user states a number that contradicts CONTEXT, CORRECT it: 'That figure differs from the artifacts; the correct value is X [Chunk].' Then answer using the correct value. Do NOT refuse unless no relevant artifact exists.",
+    "3. If asked to 'confirm' or 'prove', evaluate whether the artifacts support the claim — don't assume true.",
     "",
-    "AGGREGATE FEATURES: Service Mean, Service Std, and Service Min are AGGREGATES across the 33 raw ratings. A coefficient on an aggregate does NOT describe a single-rating change. If the user claims a coefficient implies a single-rating effect, refuse and explain the distinction.",
+    "AGGREGATE FEATURES: Service Mean, Service Std, Service Min are AGGREGATES across 33 raw ratings. Their coefficients do NOT describe single-rating effects. If a user claims otherwise, refuse and explain.",
     "",
-    "CAUSALITY: SHAP values are model attributions, not causal effects. Do NOT claim a feature 'causes' satisfaction, that 'fixing X will raise satisfaction', or that the model 'proves' anything causal. Cite [Limitations & Caveats]. Associations require pilots to confirm.",
+    "CAUSALITY: SHAP values are model attributions, not causal effects. Do NOT claim a feature 'causes' satisfaction or that 'fixing X will raise satisfaction'. Cite [Limitations & Caveats]. Associations require pilots.",
     "",
-    "STATISTICAL SCALE: At n≈700k, all coefficients are statistically significant. Significance ≠ importance. Prioritize by effect size (coefficient magnitude, OR, lift), not by p-value alone.",
+    "STATISTICAL SCALE: At n≈700k, all coefficients are statistically significant. Significance ≠ importance. Prioritize by effect size (coefficient, OR, lift), not p-value.",
     "",
-    "MODEL A vs MODEL B: Model A (predictive) uses all 33 raw ratings. Model B (interpretive) EXCLUDES raw ratings but INCLUDES aggregate statistics (mean/std/min of ratings) AND non-rating categorical features (Customer Type, Type of Travel, Class, etc.).",
+    "MODEL A vs B: Model A (predictive) uses all 33 raw ratings. Model B (interpretive) EXCLUDES raw ratings but INCLUDES aggregate statistics (mean/std/min) AND non-rating categorical features (Customer Type, Type of Travel, Class, etc.).",
     "",
     "MEMORY: assistant turns include '(Chart N: title — label=value)' summaries. If user references a chart that doesn't exist, name what exists and explain instead of refusing.",
     "",
     "CHART REFS: in prose use 'Chart 1' — NEVER square brackets. Brackets are citations only.",
     "",
-    "RANKING: never call a lever 'highest lift' if another has larger lift. State criterion. Wi-Fi=+5.37pp raw, Online Boarding=+4.99pp raw but #1 on lift-per-cost. Never imply Online Boarding has higher raw lift.",
+    "RANKING: never call a lever 'highest lift' if another has larger lift. State criterion. Wi-Fi=+5.37pp raw, Online Boarding=+4.99pp raw but #1 on lift-per-cost.",
     "",
-    "CROSS-METRIC: do NOT compare odds ratio to mean |SHAP|. Refuse OR↔SHAP; offer OR↔OR or SHAP↔SHAP.",
+    "CROSS-METRIC: do NOT compare odds ratio to mean |SHAP| (different scales). Refuse OR↔SHAP; offer OR↔OR or SHAP↔SHAP.",
     "",
     "SCATTER: list EVERY feature appearing in BOTH retrieved chunks. x=mean|SHAP|, y=odds ratio.",
     "",
-    "CHART TYPE: bar for unordered categories. line only for ordered axes. Pie coerced to bar if values aren't compositional.",
+    "CHART TYPE: bar for unordered categories (levers, segments, features). line only for ordered axes (time, delay buckets, rank). If user explicitly requests line for unordered categories, provide it + one sentence: 'Note: a bar chart is more appropriate for unordered categories.' Pie coerced to bar if values aren't compositional.",
+    "",
+    "CAPABILITY QUESTIONS: if user asks 'what can you do', 'what charts can you build', 'what plots are available' — describe in PROSE only. Do NOT emit chart JSON unless they ask for a specific chart.",
+    "",
+    "REFUSAL FOLLOWUPS: if the previous turn was a refusal and the user asks 'why' / 'explain', explain what specific artifact or data is MISSING — name the exact data type required. Do NOT switch to a different topic from earlier in the conversation.",
     "",
     "FILES: cannot produce files. Say 'I can't generate files, but here is a slide-ready content outline:' then provide outline + chart JSON.",
     "",
-    "CHART FORMAT: wrap JSON in ```chart ... ```. Types: bar, line, pie, scatter. Bar/line/pie rows: {label, value}. Scatter rows: {label, x, y}.",
+    "CHART FORMAT: wrap JSON in ```chart ... ```. Types: bar, line, pie, scatter. The top-level key MUST be \"data\" (not \"rows\"). Bar/line/pie: {\"data\": [{\"label\": str, \"value\": number}]}. Scatter: {\"data\": [{\"label\": str, \"x\": number, \"y\": number}]}.",
     "",
     "CITATIONS: after each factual sentence add [Chunk Title]. No CJK brackets, no [Chart N], no (Source: X)."
 ])
@@ -134,16 +136,14 @@ SYSTEM_PROMPT = "\n".join([
 SELF_CHECK_PROMPT = "\n".join([
     "You are auditing a proposed answer for statistical integrity.",
     "",
-    "Check the proposed answer for these FAILURES:",
-    "1. CONFIRMING A FALSE PREMISE — did the answer say 'yes' / 'confirmed' / 'exactly' to a claim that CONTEXT does not support?",
-    "2. CAUSAL OVERCLAIM — did it say a feature 'causes', 'proves', 'guarantees', or 'will definitely raise' satisfaction? SHAP is attribution.",
-    "3. AGGREGATE CONFLATION — did it treat Service Mean/Std/Min as if they describe single-rating effects?",
-    "4. ACCEPTED FALSE NUMBERS — did it use a number the user provided that is NOT in CONTEXT?",
+    "Check for these FAILURES:",
+    "1. CONFIRMING A FALSE PREMISE — did the answer say 'yes' / 'confirmed' / 'exactly' to a claim CONTEXT doesn't support?",
+    "2. CAUSAL OVERCLAIM — did it say a feature 'causes', 'proves', 'guarantees', or 'will definitely raise' satisfaction?",
+    "3. AGGREGATE CONFLATION — did it treat Service Mean/Std/Min as if single-rating effects?",
+    "4. ACCEPTED FALSE NUMBERS — did it use a user-provided number that isn't in CONTEXT? Correct it instead.",
     "5. MISSING CITATIONS — does any factual claim lack [Chunk Title]?",
     "",
-    "If any failure: REWRITE the answer to fix it, refuse the false premise, cite the correct evidence.",
-    "If no failures: return the answer UNCHANGED.",
-    "Return ONLY the final answer text (no audit commentary)."
+    "If any failure: REWRITE the answer to fix it. If no failures: return UNCHANGED. Return ONLY the answer text."
 ])
 
 USER_TEMPLATE = "\n".join([
@@ -225,10 +225,23 @@ def _chart_hint(history: list, question: str) -> str:
     labels = ", ".join(f"{d.get('label','')}={d.get('value', d.get('x',''))}" for d in target.get("data", [])[:8])
     return f"{prefix}'{target.get('title','chart')}' with data: {labels}."
 
+# FIX 3: refusal follow-up detection
+def _last_was_refusal(history: list) -> bool:
+    for m in reversed(history):
+        if m.get("role") == "assistant":
+            content = (m.get("content") or "").lower()
+            return ("not contain this information" in content
+                    or "do not contain" in content
+                    or "don't contain" in content)
+    return False
+
 def build_search_query(question: str, history: list) -> str:
     if not history:
         return question
-    q_lower = question.lower()
+    q_lower = question.lower().strip()
+    # FIX 3: meta-followup after refusal → return "" to trigger META mode
+    if _last_was_refusal(history) and q_lower in META_FOLLOWUPS:
+        return ""
     if len(question.split()) < 4 or any(t in q_lower for t in ANAPHORA_TOKENS):
         recent = " ".join(m.get("content", "") for m in history[-6:] if m.get("role") == "user").strip()
         return (_chart_hint(history, question) + " " + recent + " " + question).strip()
@@ -245,9 +258,9 @@ def normalize_citations(text: str) -> str:
     return text.strip()
 
 # =============================================================================
-# VERIFICATION
+# VERIFICATION  (FIX 2: broader pattern + rounding tolerance)
 # =============================================================================
-NUM_PATTERN = re.compile(r'\b(\d{1,3}(?:,\d{3})+|\d+\.\d{3,}|\d{5,})\b')
+NUM_PATTERN = re.compile(r'\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\b\d+\.\d{2,}\b|\b\d{5,}\b')
 
 def _extract_nums(text: str) -> set:
     out = set()
@@ -264,12 +277,14 @@ def verify_numbers(answer: str, retrieved: list) -> list:
         ctx_nums |= _extract_nums(c["text"])
     unverified = []
     for m in NUM_PATTERN.finditer(answer):
-        raw = m.group(1)
+        raw = m.group(0)
         try:
             v = round(float(raw.replace(',', '')), 4)
         except ValueError:
             continue
-        if not any(abs(v - c) <= max(0.001, abs(v) * 0.001) for c in ctx_nums):
+        # FIX 2: rounding-aware — 5.37 in answer matches 5.374 in context
+        decimals = len(raw.split('.')[1]) if '.' in raw else 0
+        if not any(round(c, decimals) == round(v, decimals) for c in ctx_nums):
             unverified.append(raw)
     return unverified
 
@@ -347,7 +362,7 @@ def _groq_call(messages, max_tok):
     raise last_err
 
 # =============================================================================
-# CORE ASK
+# CORE ASK  (FIX 3: meta-followup handling)
 # =============================================================================
 def _needs_self_check(question: str) -> bool:
     q = question.lower()
@@ -356,15 +371,27 @@ def _needs_self_check(question: str) -> bool:
 def _ask_impl(question: str, history: list):
     search_q = build_search_query(question, history)
     is_visual_query = any(kw in question.lower() for kw in ["chart", "plot", "graph", "visual", "ppt", "presentation"])
-    retrieved, raw_max = retrieve(search_q)
 
-    if not is_visual_query and not history and raw_max < MIN_RAW_SIM and len(question.split()) > 3:
-        return "The provided model artifacts do not contain this information.", [], False
+    retrieved = []
+    meta_mode = (search_q == "")
 
-    context = "\n\n".join(f"[{c['title']}]\n{sanitize_context(c['text'])}" for c in retrieved)
-    hint = _chart_hint(history, question)
-    if hint:
-        context = f"CHART CONTEXT: {hint}\n\n{context}"
+    if meta_mode:
+        # FIX 3: meta-followup after refusal — skip retrieval, explain the refusal
+        last_user_q = next((m.get("content", "") for m in reversed(history) if m.get("role") == "user"), "")
+        context = (
+            f"META-INSTRUCTION: You just refused the user's previous question: '{last_user_q}'. "
+            f"The user is asking 'why'. Explain concisely (2-3 sentences) what SPECIFIC artifact or data would be needed to answer their question. "
+            f"Name the exact data type required (e.g., 'ROC curve data (TPR/FPR at each threshold)', 'per-country satisfaction aggregates'). "
+            f"Do NOT switch to a different topic from earlier in the conversation. Do NOT re-explain an unrelated answer."
+        )
+    else:
+        retrieved, raw_max = retrieve(search_q)
+        if not is_visual_query and not history and raw_max < MIN_RAW_SIM and len(question.split()) > 3:
+            return "The provided model artifacts do not contain this information.", [], False
+        context = "\n\n".join(f"[{c['title']}]\n{sanitize_context(c['text'])}" for c in retrieved)
+        hint = _chart_hint(history, question)
+        if hint:
+            context = f"CHART CONTEXT: {hint}\n\n{context}"
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
@@ -398,7 +425,7 @@ def _ask_impl(question: str, history: list):
             return "⏳ **Groq rate limit hit.** Check https://console.groq.com/settings/billing", [], False
         return f"LLM error: {e}", [], False
 
-    if _needs_self_check(question) and not is_visual_query:
+    if _needs_self_check(question) and not is_visual_query and not meta_mode:
         try:
             check_msgs = [
                 {"role": "system", "content": SELF_CHECK_PROMPT},
@@ -430,7 +457,7 @@ def ask(question: str, history=None):
     return _ask_impl(question, history)
 
 # =============================================================================
-# PARSER
+# PARSER  (FIX 1: rows/items/names aliases)
 # =============================================================================
 def _try_parse_chart(raw: str):
     raw = raw.strip()
@@ -440,13 +467,33 @@ def _try_parse_chart(raw: str):
         data = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict) or "data" not in data or "type" not in data:
+    if not isinstance(data, dict):
+        return None
+
+    # FIX 1a: accept alternate top-level keys for the data array
+    if "data" not in data:
+        for alias in ("rows", "items", "values", "entries"):
+            if alias in data and isinstance(data[alias], list):
+                data["data"] = data.pop(alias)
+                break
+
+    if "data" not in data or "type" not in data:
         return None
     if not isinstance(data["data"], list) or not data["data"]:
         return None
+
+    # FIX 1b: accept name→label aliasing inside rows
+    for row in data["data"]:
+        if isinstance(row, dict) and "label" not in row:
+            if "name" in row:
+                row["label"] = row.pop("name")
+            elif "category" in row:
+                row["label"] = row.pop("category")
+
     data["type"] = str(data.get("type", "bar")).lower()
     if data["type"] not in ("bar", "line", "pie", "scatter"):
         data["type"] = "bar"
+
     if data["type"] == "scatter":
         for row in data["data"]:
             if not isinstance(row, dict) or "label" not in row or "x" not in row or "y" not in row:
@@ -457,7 +504,14 @@ def _try_parse_chart(raw: str):
                 return None
     else:
         for row in data["data"]:
-            if not isinstance(row, dict) or "label" not in row or "value" not in row:
+            if not isinstance(row, dict) or "label" not in row:
+                return None
+            if "value" not in row:
+                for v_alias in ("count", "amount", "v"):
+                    if v_alias in row:
+                        row["value"] = row.pop(v_alias)
+                        break
+            if "value" not in row:
                 return None
             try:
                 row["value"] = float(row["value"])
@@ -567,9 +621,7 @@ if "usage" not in st.session_state:
 
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
-    st.session_state.bypass_cache = st.checkbox(
-        "Force fresh response (bypass cache)", value=False,
-    )
+    st.session_state.bypass_cache = st.checkbox("Force fresh response (bypass cache)", value=False)
     if st.button("Clear chat + reset usage", use_container_width=True):
         st.session_state.messages = []
         st.session_state.usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
@@ -587,16 +639,11 @@ with st.sidebar:
 
     st.markdown("### 📊 Session usage")
     st.metric("Total tokens", f"{st.session_state.usage['total']:,}")
-    st.caption(
-        f"Prompt: {st.session_state.usage['prompt']:,} · "
-        f"Completion: {st.session_state.usage['completion']:,} · "
-        f"Calls: {st.session_state.usage['calls']}"
-    )
+    st.caption(f"Prompt: {st.session_state.usage['prompt']:,} · Completion: {st.session_state.usage['completion']:,} · Calls: {st.session_state.usage['calls']}")
     if st.session_state.usage['calls'] > 0:
         avg = st.session_state.usage['total'] / st.session_state.usage['calls']
         st.caption(f"Avg cost/call: **{avg:,.0f}** tokens")
     st.caption(f"Est. remaining (200k cap): **{max(0, 200_000 - st.session_state.usage['total']):,}**")
-    st.caption("Free tier reset: daily. [Console](https://console.groq.com/settings/billing)")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
