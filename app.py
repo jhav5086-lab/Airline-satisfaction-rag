@@ -24,8 +24,10 @@ if not os.path.exists("./embeddings/embeddings.npy") or not os.path.exists("./em
 
 MODEL = "openai/gpt-oss-20b"
 TOP_K = 6
-MIN_RAW_SIM = 0.10
+MIN_RAW_SIM = 0.20          # FIX: raised from 0.10
 HISTORY_TURNS = 4
+MAX_TOKENS_DEFAULT = 1500
+MAX_TOKENS_VISUAL = 3000    # FIX: avoid truncating multi-chart answers
 
 # =============================================================================
 # BACKEND LOAD
@@ -43,7 +45,7 @@ embedder, EMBEDDINGS, CHUNKS, groq_client = load_backend()
 EMBEDDINGS_NORM = EMBEDDINGS / (np.linalg.norm(EMBEDDINGS, axis=1, keepdims=True) + 1e-9)
 
 # =============================================================================
-# DYNAMIC PROMPTS (Safe from copy-paste syntax errors)
+# SYSTEM PROMPT  (FIX 3: ranking + cross-metric rules + memory rules)
 # =============================================================================
 SYSTEM_PROMPT = "\n".join([
     "You are a dynamic senior data science consultant for an airline passenger satisfaction model.",
@@ -57,6 +59,21 @@ SYSTEM_PROMPT = "\n".join([
     "## GROUNDING",
     "- Use ONLY facts from CONTEXT for claims about THIS model.",
     "- If a factual question is not in CONTEXT: reply exactly 'The provided model artifacts do not contain this information.'",
+    "",
+    "## CONVERSATION MEMORY",
+    "- Assistant turns may include chart summaries of the form '[Chart: title — label=value]'.",
+    "- When the user says 'previous chart', 'that chart', 'it', or similar, refer to those summaries.",
+    "- For 'previous to previous' or older references, scan further back in conversation history.",
+    "",
+    "## RANKING RULES (CRITICAL)",
+    "- Never call a lever 'highest lift' if another lever in CONTEXT has a larger numeric lift.",
+    "- When naming a priority, state the ranking criterion in the same sentence: e.g. 'ranked by lift per unit cost' or 'ranked by raw lift'.",
+    "- Wi-Fi has higher raw lift (+5.37pp) than Online Boarding (+4.99pp); Online Boarding ranks first on lift-per-cost. Never imply the opposite.",
+    "",
+    "## CROSS-METRIC COMPARISONS",
+    "- Do NOT compare an odds ratio to a mean |SHAP| value — they are on different scales and mean different things.",
+    "- Compare like-with-like: OR vs coefficient, or SHAP vs SHAP.",
+    "- If the user asks for an OR-vs-SHAP comparison, state the incompatibility and offer the correct comparison instead.",
     "",
     "## CHART FORMAT (CRITICAL)",
     "You MUST wrap the JSON in triple backticks. Do NOT forget the opening `{` and closing `}`.",
@@ -106,6 +123,8 @@ INTENT_KEYWORDS = {
     "recommendations": ["recommend", "suggest", "what to do"],
 }
 
+ANAPHORA_TOKENS = ("previous", "that chart", "this chart", "the chart", "above", "last one", "last chart")
+
 def detect_intents(query: str) -> set:
     q = query.lower()
     hints = set()
@@ -134,16 +153,24 @@ def retrieve(query: str, top_k: int = TOP_K):
         "title": CHUNKS[i]["title"],
         "type": CHUNKS[i]["type"],
         "text": CHUNKS[i]["text"],
-        "score": float(sims[i]),
+        "score": float(sims[i]),          # internal boosted score
+        "raw_score": float(raw_sims[i]),  # FIX: user-facing raw cosine
     } for i in top_idx]
     return results, raw_max
 
-def build_search_query(question: str, history: list) -> str:
+# FIX 1: anaphora detection + chart hint so follow-ups don't get refused
+def build_search_query(question: str, history: list, last_chart: dict = None) -> str:
     if not history:
         return question
-    if len(question.split()) < 4:
-        last_q = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
-        return f"{last_q} {question}"
+    q_lower = question.lower()
+    is_anaphora = any(tok in q_lower for tok in ANAPHORA_TOKENS)
+    if len(question.split()) < 4 or is_anaphora:
+        recent_user = " ".join(m.get("content", "") for m in history[-6:] if m.get("role") == "user").strip()
+        chart_hint = ""
+        if last_chart:
+            labels = ", ".join(str(d.get("label", "")) for d in last_chart.get("data", [])[:8])
+            chart_hint = f"chart {last_chart.get('title', '')}: {labels}. "
+        return (chart_hint + recent_user + " " + question).strip()
     return question
 
 def sanitize_context(text: str) -> str:
@@ -157,98 +184,231 @@ def normalize_citations(text: str) -> str:
     return text.strip()
 
 # =============================================================================
+# FIX 2: VERIFICATION (numeric + citation)
+# =============================================================================
+NUM_PATTERN = re.compile(r'\b(\d{1,3}(?:,\d{3})+|\d+\.\d{3,}|\d{5,})\b')
+
+def _extract_nums(text: str) -> set:
+    out = set()
+    for n in re.findall(r'\d{1,3}(?:,\d{3})+|\d+\.\d+|\d+', text):
+        try:
+            out.add(round(float(n.replace(',', '')), 4))
+        except ValueError:
+            pass
+    return out
+
+def verify_numbers(answer: str, retrieved: list) -> list:
+    ctx_nums = set()
+    for c in retrieved:
+        ctx_nums |= _extract_nums(c["text"])
+    unverified = []
+    for m in NUM_PATTERN.finditer(answer):
+        raw = m.group(1)
+        try:
+            v = round(float(raw.replace(',', '')), 4)
+        except ValueError:
+            continue
+        if not any(abs(v - c) <= max(0.001, abs(v) * 0.001) for c in ctx_nums):
+            unverified.append(raw)
+    return unverified
+
+def verify_citations(answer: str, retrieved: list) -> list:
+    titles = {c["title"] for c in retrieved}
+    bad = []
+    for cite in re.findall(r'\[([^\]]+)\]', answer):
+        if cite in titles:
+            continue
+        if re.fullmatch(r'[\d\s,;]+', cite):  # numeric refs, ignore
+            continue
+        bad.append(cite)
+    return bad
+
+def apply_verification(text: str, retrieved: list) -> str:
+    if not text or not retrieved:
+        return text
+    if text.strip() == "The provided model artifacts do not contain this information.":
+        return text
+    warnings = []
+    unverified = verify_numbers(text, retrieved)
+    if unverified:
+        warnings.append(f"⚠️ **Unverified figures:** {', '.join(sorted(set(unverified)))} — not found verbatim in retrieved chunks.")
+    bad = verify_citations(text, retrieved)
+    if bad:
+        warnings.append(f"⚠️ **Uncited sources:** {', '.join(f'[{b}]' for b in sorted(set(bad)))} — not among retrieved chunks.")
+    if warnings:
+        return text + "\n\n" + "  \n".join(f"> {w}" for w in warnings)
+    return text
+
+# =============================================================================
 # CORE ASK
 # =============================================================================
-def ask(question: str, history=None):
+def ask(question: str, history=None, last_chart=None):
     if history is None:
         history = []
 
-    search_q = build_search_query(question, history)
+    search_q = build_search_query(question, history, last_chart=last_chart)
     is_visual_query = any(kw in question.lower() for kw in ["chart", "plot", "graph", "visual", "ppt", "presentation"])
     retrieved, raw_max = retrieve(search_q)
 
     if not is_visual_query and raw_max < MIN_RAW_SIM and len(question.split()) > 3:
-        return "The provided model artifacts do not contain this information.", [], []
+        return "The provided model artifacts do not contain this information.", [], False
 
     context = "\n\n".join(f"[{c['title']}]\n{sanitize_context(c['text'])}" for c in retrieved)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in history:
-        messages.append({"role": m["role"], "content": m["content"][:600]})
+        content = m.get("content") or ""
+        if m.get("charts"):
+            # FIX 1: replay chart summaries so follow-ups can reference them
+            summaries = []
+            for c in m["charts"]:
+                pairs = ", ".join(f"{d.get('label', '')}={d.get('value', '')}" for d in c.get("data", [])[:8])
+                summaries.append(f"[Chart: {c.get('title', 'chart')} — {pairs}]")
+            content = (content + "\n" + "\n".join(summaries)).strip()
+        if content:
+            messages.append({"role": m["role"], "content": content[:1000]})
+
     messages.append({"role": "user", "content": USER_TEMPLATE.format(context=context, question=question)})
 
+    max_tok = MAX_TOKENS_VISUAL if is_visual_query else MAX_TOKENS_DEFAULT
     try:
         resp = groq_client.chat.completions.create(
             model=MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=max_tok,
         )
         answer = resp.choices[0].message.content or ""
     except Exception as e:
-        return f"LLM error: {e}", [], []
+        return f"LLM error: {e}", [], False
 
     return normalize_citations(answer), retrieved, is_visual_query
 
 # =============================================================================
 # PARSER & RENDERER
 # =============================================================================
+def _try_parse_chart(raw: str):
+    raw = raw.strip()
+    if not raw.startswith("{") or not raw.endswith("}"):
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or "data" not in data or "type" not in data:
+        return None
+    if not isinstance(data["data"], list) or not data["data"]:
+        return None
+    for row in data["data"]:
+        if not isinstance(row, dict) or "label" not in row or "value" not in row:
+            return None
+        try:
+            row["value"] = float(row["value"])
+        except (TypeError, ValueError):
+            return None
+    data["type"] = str(data.get("type", "bar")).lower()
+    if data["type"] not in ("bar", "line", "pie"):
+        data["type"] = "bar"
+    return data
+
+def _find_matching_brace(text: str, start: int) -> int:
+    """Return index of matching '}' for text[start] == '{', respecting strings. -1 if not found."""
+    if start >= len(text) or text[start] != "{":
+        return -1
+    depth, i, in_string, escape = 0, start, False, False
+    while i < len(text):
+        c = text[i]
+        if escape:
+            escape = False
+        elif c == "\\":
+            escape = True
+        elif c == '"':
+            in_string = not in_string
+        elif not in_string:
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
 def parse_response(answer: str):
-    """Extracts all JSON chart blocks and removes them from the text."""
-    # Regex to find wrapped JSON blocks or raw JSON objects
-    pattern = r'```(?:json|chart)?\s*(\{[\s\S]*?\})\s*```|(\{[\s\S]*?"title"[\s\S]*?\})'
-    matches = re.findall(pattern, answer)
-    
+    """Extract chart JSON (fenced + raw) and strip them from text. Robust to multi-chart."""
     charts = []
     clean_text = answer
-    
-    for match in matches:
-        raw_json = match[0] if match[0] else match[1]
-        try:
-            # Auto-fix if LLM forgot brackets
-            if not raw_json.strip().startswith("{"): raw_json = "{" + raw_json
-            if not raw_json.strip().endswith("}"): raw_json = raw_json + "}"
-            
-            data = json.loads(raw_json)
-            if "data" in data and "type" in data:
-                charts.append(data)
-                # Remove this JSON from the text so we don't print it
-                clean_text = clean_text.replace(raw_json, "")
-        except:
-            pass # Not valid JSON, ignore
 
-    # Strip any leftover empty backticks, empty chart tags, or refusal text if charts exist
-    clean_text = re.sub(r'```(?:json|chart)?\s*```', '', clean_text).strip()
+    # Pass 1: fenced blocks — remove only those that parse as charts
+    fenced_pattern = re.compile(r'```(?:chart|json)?\s*\n?([\s\S]*?)```', re.MULTILINE)
+    def _replace(m):
+        data = _try_parse_chart(m.group(1))
+        if data:
+            charts.append(data)
+            return ""
+        return m.group(0)
+    clean_text = fenced_pattern.sub(_replace, clean_text)
+
+    # Pass 2: raw JSON in remaining text
+    i = 0
+    while i < len(clean_text):
+        if clean_text[i] == "{":
+            end = _find_matching_brace(clean_text, i)
+            if end != -1:
+                data = _try_parse_chart(clean_text[i:end + 1])
+                if data:
+                    charts.append(data)
+                    clean_text = clean_text[:i] + clean_text[end + 1:]
+                    continue
+        i += 1
+
+    clean_text = clean_text.strip()
     if charts and clean_text == "The provided model artifacts do not contain this information.":
-        clean_text = "" # If we have charts, hide the refusal text
-        
+        clean_text = ""
     return clean_text, charts
 
+def _pie_is_valid(values) -> bool:
+    vals = [float(v) for v in values if v is not None]
+    if not vals:
+        return False
+    s = sum(vals)
+    if 50 <= s <= 105:                              # percentage composition
+        return True
+    if 0.9 <= s <= 1.1 and all(v <= 1.05 for v in vals):  # fractional composition
+        return True
+    return False
+
 def render_chart(chart_data):
-    """Renders a beautiful, labeled chart using Altair."""
     df = pd.DataFrame(chart_data["data"])
     chart_type = chart_data.get("type", "bar").lower()
     x_title = chart_data.get("x_label", "")
     y_title = chart_data.get("y_label", "")
     title = chart_data.get("title", "Chart")
 
+    # FIX 4: coerce misleading pies to bars
+    if chart_type == "pie" and not _pie_is_valid(df["value"].tolist()):
+        chart_type = "bar"
+
+    if chart_type in ("bar", "line"):
+        df = df.sort_values("value", ascending=False).reset_index(drop=True)  # FIX 4: deterministic order
+
     if chart_type == "pie":
         chart = alt.Chart(df).mark_arc(innerRadius=50).encode(
             theta=alt.Theta(field="value", type="quantitative"),
-            color=alt.Color(field="label", type="nominal", title=x_title),
-            tooltip=['label', 'value']
+            color=alt.Color(field="label", type="nominal", title=x_title or "Category"),
+            tooltip=["label", "value"],
         ).properties(title=title, height=400)
     elif chart_type == "line":
         chart = alt.Chart(df).mark_line(point=True).encode(
-            x=alt.X("label:N", title=x_title, axis=alt.Axis(labelAngle=-45)),
+            x=alt.X("label:N", title=x_title, sort=df["label"].tolist(), axis=alt.Axis(labelAngle=-45)),
             y=alt.Y("value:Q", title=y_title),
-            tooltip=['label', 'value']
+            tooltip=["label", "value"],
         ).properties(title=title)
-    else: # bar
+    else:
         chart = alt.Chart(df).mark_bar().encode(
-            x=alt.X("label:N", title=x_title, axis=alt.Axis(labelAngle=-45)),
+            x=alt.X("label:N", title=x_title, sort=df["label"].tolist(), axis=alt.Axis(labelAngle=-45)),
             y=alt.Y("value:Q", title=y_title),
-            tooltip=['label', 'value']
+            tooltip=["label", "value"],
         ).properties(title=title)
 
     st.altair_chart(chart, use_container_width=True)
@@ -262,6 +422,12 @@ st.caption("Ask questions grounded in coefficients, SHAP, and what-if analysis. 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+def _last_chart_from_history():
+    for m in reversed(st.session_state.messages):
+        if m.get("charts"):
+            return m["charts"][-1]
+    return None
+
 # Render chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -273,45 +439,38 @@ for msg in st.session_state.messages:
         if msg.get("sources"):
             with st.expander(f"Sources ({len(msg['sources'])})"):
                 for s in msg["sources"]:
-                    st.markdown(f"**{s['title']}** (`{s['type']}`) — score {s['score']:.3f}")
+                    score = s.get("raw_score", s.get("score", 0.0))
+                    st.markdown(f"**{s['title']}** (`{s['type']}`) — raw cosine {score:.3f}")
 
 def process(q: str):
-    # Get last 4 turns for context
     history = st.session_state.messages[-2 * HISTORY_TURNS:]
-    
-    # Add user message
+    last_chart = _last_chart_from_history()
+
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.markdown(q)
 
     with st.chat_message("assistant"):
         with st.spinner("Analyzing..."):
-            raw_answer, retrieved, is_visual = ask(q, history=history)
-            
-            # Parse out text and charts
+            raw_answer, retrieved, _ = ask(q, history=history, last_chart=last_chart)
             clean_text, charts = parse_response(raw_answer)
-            
-            # Render text if any
+            clean_text = apply_verification(clean_text, retrieved)  # FIX 2
+
             if clean_text:
                 st.markdown(clean_text)
-                
-            # Render charts if any
-            if charts:
-                for c in charts:
-                    render_chart(c)
-            
-            # Render sources
+            for c in charts:
+                render_chart(c)
             if retrieved:
                 with st.expander(f"Sources ({len(retrieved)})"):
                     for c in retrieved:
-                        st.markdown(f"**{c['title']}** (`{c['type']}`) — score {c['score']:.3f}")
-            
-            # Save to state
+                        score = c.get("raw_score", c.get("score", 0.0))
+                        st.markdown(f"**{c['title']}** (`{c['type']}`) — raw cosine {score:.3f}")
+
             st.session_state.messages.append({
-                "role": "assistant", 
+                "role": "assistant",
                 "content": clean_text,
                 "charts": charts,
-                "sources": retrieved
+                "sources": retrieved,
             })
 
 if user_q := st.chat_input("Ask anything... (e.g., 'generate a bar chart of the what-if levers')"):
