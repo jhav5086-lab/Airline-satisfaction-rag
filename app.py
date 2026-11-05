@@ -1,6 +1,7 @@
 import re
 import json
 import os
+import time
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -9,28 +10,31 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 
 # =============================================================================
-# CONFIG
+# CONFIG  (FIX 15: token budget reduction)
 # =============================================================================
 st.set_page_config(page_title="Airline Satisfaction RAG", page_icon="🛫", layout="wide")
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    st.error("🚨 **Missing API Key:** Please go to Settings -> Secrets and add GROQ_API_KEY.")
+    st.error("🚨 **Missing API Key:** add GROQ_API_KEY to Streamlit secrets.")
     st.stop()
 
 if not os.path.exists("./embeddings/embeddings.npy") or not os.path.exists("./embeddings/chunks.json"):
-    st.error("🚨 **Missing Files:** Could not find the `./embeddings/` folder.")
+    st.error("🚨 **Missing Files:** could not find ./embeddings/ folder.")
     st.stop()
 
 MODEL = "openai/gpt-oss-20b"
-TOP_K = 6
+TOP_K = 4                    # FIX 15: was 6
 MIN_RAW_SIM = 0.10
-HISTORY_TURNS = 4
-MAX_TOKENS_DEFAULT = 1500
-MAX_TOKENS_VISUAL = 3000
+HISTORY_TURNS = 2            # FIX 15: was 4
+HISTORY_MSG_CHARS = 500      # FIX 15: was 1200
+MAX_TOKENS_DEFAULT = 800     # FIX 15: was 1500
+MAX_TOKENS_VISUAL = 2000     # FIX 15: was 3000
 INTENT_BOOST_MULT = 2.0
 INTENT_BOOST_ADD = 0.20
 REPORT_PENALTY = 0.15
+MAX_RETRIES = 2              # FIX 13
+MAX_WAIT_SECONDS = 120       # FIX 13
 
 # =============================================================================
 # BACKEND LOAD
@@ -48,80 +52,34 @@ embedder, EMBEDDINGS, CHUNKS, groq_client = load_backend()
 EMBEDDINGS_NORM = EMBEDDINGS / (np.linalg.norm(EMBEDDINGS, axis=1, keepdims=True) + 1e-9)
 
 # =============================================================================
-# SYSTEM PROMPT  (FIX 9/10/11/12: chart refs, scatter, files, chart types)
+# SYSTEM PROMPT  (FIX 15: compressed ~900 → ~380 tokens)
 # =============================================================================
 SYSTEM_PROMPT = "\n".join([
-    "You are a dynamic senior data science consultant for an airline passenger satisfaction model.",
+    "You are a senior data science consultant for an airline passenger satisfaction model.",
     "",
-    "## STYLE",
-    "- Answer in 2-4 sentences. Direct answer first. No preamble.",
-    "- If the user asks for a chart, plot, graph, PPT, or visual, you MUST generate Chart JSON blocks.",
-    "- Never say 'I cannot render charts' — generate the JSON block so the UI can render it.",
-    "- If the user asks for 'all plots', output MULTIPLE JSON blocks.",
+    "STYLE: 2-4 sentences, direct answer first. Never refuse charts — generate JSON. 'all plots' = multiple JSON blocks.",
     "",
-    "## GROUNDING",
-    "- Use ONLY facts from CONTEXT for claims about THIS model.",
-    "- If a factual question is not in CONTEXT: reply exactly 'The provided model artifacts do not contain this information.'",
+    "GROUNDING: use ONLY facts in CONTEXT. If not in CONTEXT: reply exactly 'The provided model artifacts do not contain this information.'",
     "",
-    "## CONVERSATION MEMORY",
-    "- Assistant turns include chart summaries of the form '(Chart N: title — label=value, ...)'.",
-    "- When the user says 'previous chart', 'that chart', 'it', or similar, refer to those summaries.",
-    "- If the user references a chart that does not exist (e.g., 'previous to previous' when only one chart has been made), acknowledge the reference, name the available chart(s), and explain what you have instead of refusing.",
+    "MEMORY: assistant turns include '(Chart N: title — label=value)' summaries. If user references a chart that doesn't exist, name what exists and explain instead of refusing.",
     "",
-    "## CHART REFERENCES IN PROSE (CRITICAL)",
-    "- When you refer to a chart in your answer, write 'Chart 1' or 'the bar chart' — NEVER wrap it in square brackets.",
-    "- Square brackets [Title] are reserved for SOURCE CITATIONS only.",
-    "- Example: 'Chart 1 shows the top SHAP drivers [Top 10 SHAP Drivers].' — correct.",
-    "- Example: '[Chart 1: SHAP Drivers]' — WRONG, this is not a citation.",
+    "CHART REFS: in prose use 'Chart 1' — NEVER square brackets. Brackets are citations only. '[Chart 1: title]' is WRONG.",
     "",
-    "## RANKING RULES (CRITICAL)",
-    "- Never call a lever 'highest lift' if another lever in CONTEXT has a larger numeric lift.",
-    "- When naming a priority, state the ranking criterion in the same sentence: e.g. 'ranked by lift per unit cost' or 'ranked by raw lift'.",
-    "- Wi-Fi has higher raw lift (+5.37pp) than Online Boarding (+4.99pp); Online Boarding ranks first on lift-per-cost. Never imply the opposite.",
+    "RANKING: never call a lever 'highest lift' if another has larger lift. State criterion (lift-per-cost or raw-lift). Wi-Fi=+5.37pp raw, Online Boarding=+4.99pp raw but #1 on lift-per-cost. Never imply Online Boarding has higher raw lift.",
     "",
-    "## CROSS-METRIC COMPARISONS",
-    "- Do NOT compare an odds ratio to a mean |SHAP| value — different scales and meanings.",
-    "- Compare like-with-like: OR vs coefficient, or SHAP vs SHAP.",
-    "- If the user asks for an OR-vs-SHAP comparison, state the incompatibility and offer the correct comparison instead.",
+    "CROSS-METRIC: do NOT compare odds ratio to mean |SHAP| (different scales). Refuse OR↔SHAP; offer OR↔OR or SHAP↔SHAP.",
     "",
-    "## SCATTER / CROSS-METRIC CHARTS (CRITICAL)",
-    "- When asked to plot SHAP vs odds ratio, list EVERY feature that appears in BOTH retrieved chunks (SHAP chunk and coefficient chunk).",
-    "- Never omit features silently. If a feature is in SHAP but not in the coefficient chunk, note it as 'no OR available'.",
-    "- Never state 'only N features have both metrics' unless you have verified each feature against both chunks.",
-    "- Scatter convention: x = mean |SHAP|, y = odds ratio. Do not swap axes between turns.",
+    "SCATTER: list EVERY feature appearing in BOTH retrieved chunks. Never claim 'only N have both metrics' without verification. Convention: x=mean|SHAP|, y=odds ratio.",
     "",
-    "## CHART TYPE GUIDANCE",
-    "- Use bar charts for unordered categories: levers, segments, feature names.",
-    "- Only use line charts for ordered axes: time, delay buckets (short/medium/long), coefficient rank.",
-    "- If the user explicitly requests a line chart for unordered categories, provide it but add one sentence: 'Note: a bar chart is more appropriate for unordered categories.'",
+    "CHART TYPE: bar for unordered categories. line only for ordered axes (time, delay buckets, coefficient rank). If user requests line for unordered, provide + one sentence caveat. Pie coerced to bar if values aren't compositional.",
     "",
-    "## FILE OUTPUT",
-    "- If the user asks for a PPT, PDF, Excel, or other file, say: 'I can\\'t generate files, but here is a slide-ready content outline:' — then provide the outline plus chart JSON blocks.",
+    "FILES: cannot produce files. Say 'I can't generate files, but here is a slide-ready content outline:' then provide outline + chart JSON.",
     "",
-    "## CHART FORMAT (CRITICAL)",
-    "You MUST wrap the JSON in triple backticks. Do NOT forget the opening `{` and closing `}`.",
-    "Supported types: 'bar', 'line', 'pie', 'scatter'.",
-    "For scatter, each data row must have 'label', 'x', and 'y' keys.",
-    "```chart",
-    "{",
-    '  "title": "Title of the Chart",',
-    '  "type": "bar",',
-    '  "x_label": "X Axis Name",',
-    '  "y_label": "Y Axis Name",',
-    '  "data": [',
-    '    {"label": "Category A", "value": 10.5},',
-    '    {"label": "Category B", "value": 20.2}',
-    "  ]",
-    "}",
-    "```",
+    "CHART FORMAT: wrap JSON in ```chart ... ```. Types: bar, line, pie, scatter. Bar/line/pie rows: {label, value}. Scatter rows: {label, x, y}.",
     "",
-    "## CITATIONS - STRICT FORMAT",
-    "- After each factual sentence (except in chart blocks), add ONE citation: [Chunk Title]",
-    "- FORBIDDEN: CJK brackets, dagger-L tokens, '(Source: X)', and bracketed chart references like [Chart 1].",
+    "CITATIONS: after each factual sentence add [Chunk Title]. No CJK brackets, no [Chart N], no (Source: X).",
     "",
-    "## MODEL A vs MODEL B",
-    "- Model A (predictive): uses ALL 33 raw service ratings.",
-    "- Model B (interpretive): EXCLUDES all raw ratings. Uses ONLY aggregates."
+    "MODEL A: all 33 raw ratings. MODEL B: only aggregates, no raw ratings."
 ])
 
 USER_TEMPLATE = "\n".join([
@@ -151,11 +109,7 @@ ANAPHORA_TOKENS = ("previous", "that chart", "this chart", "the chart", "above",
 
 def detect_intents(query: str) -> set:
     q = query.lower()
-    hints = set()
-    for ctype, kws in INTENT_KEYWORDS.items():
-        if any(kw in q for kw in kws):
-            hints.add(ctype)
-    return hints
+    return {t for t, kws in INTENT_KEYWORDS.items() if any(kw in q for kw in kws)}
 
 def retrieve(query: str, top_k: int = TOP_K):
     q_emb = embedder.encode([query], convert_to_numpy=True)[0]
@@ -175,11 +129,8 @@ def retrieve(query: str, top_k: int = TOP_K):
 
     top_idx = list(np.argsort(sims)[::-1][:top_k])
     results = [{
-        "title": CHUNKS[i]["title"],
-        "type": CHUNKS[i]["type"],
-        "text": CHUNKS[i]["text"],
-        "score": float(sims[i]),
-        "raw_score": float(raw_sims[i]),
+        "title": CHUNKS[i]["title"], "type": CHUNKS[i]["type"], "text": CHUNKS[i]["text"],
+        "score": float(sims[i]), "raw_score": float(raw_sims[i]),
     } for i in top_idx]
     return results, raw_max
 
@@ -188,8 +139,7 @@ def _get_chart_back(question: str) -> int:
     back = 0
     for phrase, n in [
         ("previous to previous", 2), ("the one before that", 2), ("the one before", 2),
-        ("one before that", 2), ("one before", 2),
-        ("previous", 1), ("prior", 1),
+        ("one before that", 2), ("one before", 2), ("previous", 1), ("prior", 1),
         ("that chart", 1), ("this chart", 1), ("the chart", 1),
         ("above", 1), ("last one", 1), ("last chart", 1),
     ]:
@@ -204,27 +154,20 @@ def _chart_hint(history: list, question: str) -> str:
         return ""
     if back <= 0 or back > len(charts):
         target = charts[-1]
-        prefix = f"Only {len(charts)} chart(s) exist in conversation. Most recent: "
+        prefix = f"Only {len(charts)} chart(s) exist. Most recent: "
     else:
         target = charts[-back]
         prefix = f"Referring to chart {len(charts) - back + 1} of {len(charts)}: "
-    labels = ", ".join(
-        f"{d.get('label', '')}={d.get('value', d.get('x', ''))}"
-        for d in target.get("data", [])[:8]
-    )
-    return f"{prefix}'{target.get('title', 'chart')}' with data: {labels}."
+    labels = ", ".join(f"{d.get('label','')}={d.get('value', d.get('x',''))}" for d in target.get("data", [])[:8])
+    return f"{prefix}'{target.get('title','chart')}' with data: {labels}."
 
 def build_search_query(question: str, history: list) -> str:
     if not history:
         return question
     q_lower = question.lower()
-    is_anaphora = any(tok in q_lower for tok in ANAPHORA_TOKENS)
-    if len(question.split()) < 4 or is_anaphora:
-        recent = " ".join(
-            m.get("content", "") for m in history[-6:] if m.get("role") == "user"
-        ).strip()
-        hint = _chart_hint(history, question)
-        return (hint + " " + recent + " " + question).strip()
+    if len(question.split()) < 4 or any(t in q_lower for t in ANAPHORA_TOKENS):
+        recent = " ".join(m.get("content", "") for m in history[-6:] if m.get("role") == "user").strip()
+        return (_chart_hint(history, question) + " " + recent + " " + question).strip()
     return question
 
 def sanitize_context(text: str) -> str:
@@ -238,7 +181,7 @@ def normalize_citations(text: str) -> str:
     return text.strip()
 
 # =============================================================================
-# VERIFICATION  (FIX 9: skip [Chart ...] patterns)
+# VERIFICATION
 # =============================================================================
 NUM_PATTERN = re.compile(r'\b(\d{1,3}(?:,\d{3})+|\d+\.\d{3,}|\d{5,})\b')
 
@@ -279,7 +222,6 @@ def verify_citations(answer: str, retrieved: list) -> list:
             continue
         if re.fullmatch(r"[\d\s,;]+", cite):
             continue
-        # FIX 9: chart references are not citations
         if cite.lower().startswith("chart "):
             continue
         if _norm_title(cite) in titles:
@@ -304,30 +246,53 @@ def apply_verification(text: str, retrieved: list) -> str:
     return text
 
 # =============================================================================
-# CORE ASK  (FIX 9: history chart summary uses parentheses)
+# FIX 13 / 16: Groq call with retry + usage tracking
 # =============================================================================
-def ask(question: str, history=None):
-    if history is None:
-        history = []
+def _track_usage(resp):
+    if hasattr(resp, "usage") and resp.usage:
+        u = resp.usage
+        st.session_state.setdefault("usage", {"prompt": 0, "completion": 0, "total": 0})
+        st.session_state.usage["prompt"] += getattr(u, "prompt_tokens", 0) or 0
+        st.session_state.usage["completion"] += getattr(u, "completion_tokens", 0) or 0
+        st.session_state.usage["total"] += getattr(u, "total_tokens", 0) or 0
 
+def _groq_call(messages, max_tok):
+    last_err = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = groq_client.chat.completions.create(
+                model=MODEL, messages=messages, temperature=0.2, max_tokens=max_tok,
+            )
+            _track_usage(resp)
+            return resp
+        except Exception as e:
+            last_err = e
+            err = str(e)
+            is_rate = ("429" in err) or ("rate_limit" in err.lower()) or ("tokens per day" in err.lower())
+            if is_rate and attempt < MAX_RETRIES:
+                m = re.search(r"try again in (?:(\d+)m)?([\d.]+)s", err)
+                wait = 30 * (attempt + 1)
+                if m:
+                    wait = int(m.group(1) or 0) * 60 + float(m.group(2) or 0)
+                if wait > MAX_WAIT_SECONDS:
+                    raise RuntimeError(f"RATE_LIMIT_LONG:{int(wait)}") from e
+                time.sleep(wait)
+                continue
+            raise
+    raise last_err
+
+# =============================================================================
+# CORE ASK
+# =============================================================================
+def _ask_impl(question: str, history: list):
     search_q = build_search_query(question, history)
-    is_visual_query = any(
-        kw in question.lower()
-        for kw in ["chart", "plot", "graph", "visual", "ppt", "presentation"]
-    )
+    is_visual_query = any(kw in question.lower() for kw in ["chart", "plot", "graph", "visual", "ppt", "presentation"])
     retrieved, raw_max = retrieve(search_q)
 
-    if (
-        not is_visual_query
-        and not history
-        and raw_max < MIN_RAW_SIM
-        and len(question.split()) > 3
-    ):
+    if not is_visual_query and not history and raw_max < MIN_RAW_SIM and len(question.split()) > 3:
         return "The provided model artifacts do not contain this information.", [], False
 
-    context = "\n\n".join(
-        f"[{c['title']}]\n{sanitize_context(c['text'])}" for c in retrieved
-    )
+    context = "\n\n".join(f"[{c['title']}]\n{sanitize_context(c['text'])}" for c in retrieved)
     hint = _chart_hint(history, question)
     if hint:
         context = f"CHART CONTEXT: {hint}\n\n{context}"
@@ -336,36 +301,51 @@ def ask(question: str, history=None):
     for m in history:
         content = m.get("content") or ""
         if m.get("charts"):
-            summaries = []
-            for idx, c in enumerate(m["charts"], 1):
-                pairs = ", ".join(
-                    f"{d.get('label', '')}={d.get('value', d.get('x', ''))}"
-                    for d in c.get("data", [])[:8]
-                )
-                # FIX 9: parentheses, not brackets
-                summaries.append(f"(Chart {idx}: {c.get('title', 'chart')} — {pairs})")
+            summaries = [
+                f"(Chart {idx}: {c.get('title','chart')} — " +
+                ", ".join(f"{d.get('label','')}={d.get('value', d.get('x',''))}" for d in c.get("data", [])[:8]) + ")"
+                for idx, c in enumerate(m["charts"], 1)
+            ]
             content = (content + "\n" + "\n".join(summaries)).strip()
         if content:
-            messages.append({"role": m["role"], "content": content[:1200]})
+            messages.append({"role": m["role"], "content": content[:HISTORY_MSG_CHARS]})
 
-    messages.append({
-        "role": "user",
-        "content": USER_TEMPLATE.format(context=context, question=question),
-    })
-
+    messages.append({"role": "user", "content": USER_TEMPLATE.format(context=context, question=question)})
     max_tok = MAX_TOKENS_VISUAL if is_visual_query else MAX_TOKENS_DEFAULT
+
     try:
-        resp = groq_client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=max_tok,
-        )
+        resp = _groq_call(messages, max_tok)
         answer = resp.choices[0].message.content or ""
+    except RuntimeError as e:
+        if str(e).startswith("RATE_LIMIT_LONG:"):
+            wait_s = int(str(e).split(":")[1])
+            mins = max(1, wait_s // 60)
+            used = st.session_state.get("usage", {}).get("total", 0)
+            return (f"⏳ **Groq daily token limit reached.** Retry in ~{mins} min, "
+                    f"or upgrade at https://console.groq.com/settings/billing. "
+                    f"Session usage: **{used:,}** tokens."), [], False
+        return f"LLM error: {e}", [], False
     except Exception as e:
+        err = str(e)
+        if "429" in err or "rate_limit" in err.lower():
+            used = st.session_state.get("usage", {}).get("total", 0)
+            return (f"⏳ **Groq rate limit hit.** Session usage: **{used:,}** tokens. "
+                    f"Check https://console.groq.com/settings/billing for reset time."), [], False
         return f"LLM error: {e}", [], False
 
     return normalize_citations(answer), retrieved, is_visual_query
+
+# FIX 14: cache empty-history asks (identical questions = 0 tokens)
+@st.cache_data(ttl=3600, max_entries=50, show_spinner=False)
+def _cached_ask(question: str):
+    return _ask_impl(question, [])
+
+def ask(question: str, history=None):
+    if history is None:
+        history = []
+    if not history and not st.session_state.get("bypass_cache", False):
+        return _cached_ask(question)
+    return _ask_impl(question, history)
 
 # =============================================================================
 # PARSER
@@ -382,20 +362,15 @@ def _try_parse_chart(raw: str):
         return None
     if not isinstance(data["data"], list) or not data["data"]:
         return None
-
     data["type"] = str(data.get("type", "bar")).lower()
     if data["type"] not in ("bar", "line", "pie", "scatter"):
         data["type"] = "bar"
-
     if data["type"] == "scatter":
         for row in data["data"]:
-            if not isinstance(row, dict):
-                return None
-            if "label" not in row or "x" not in row or "y" not in row:
+            if not isinstance(row, dict) or "label" not in row or "x" not in row or "y" not in row:
                 return None
             try:
-                row["x"] = float(row["x"])
-                row["y"] = float(row["y"])
+                row["x"] = float(row["x"]); row["y"] = float(row["y"])
             except (TypeError, ValueError):
                 return None
     else:
@@ -406,7 +381,6 @@ def _try_parse_chart(raw: str):
                 row["value"] = float(row["value"])
             except (TypeError, ValueError):
                 return None
-
     return data
 
 def _find_matching_brace(text: str, start: int) -> int:
@@ -415,49 +389,38 @@ def _find_matching_brace(text: str, start: int) -> int:
     depth, i, in_string, escape = 0, start, False, False
     while i < len(text):
         c = text[i]
-        if escape:
-            escape = False
-        elif c == "\\":
-            escape = True
-        elif c == '"':
-            in_string = not in_string
+        if escape: escape = False
+        elif c == "\\": escape = True
+        elif c == '"': in_string = not in_string
         elif not in_string:
-            if c == "{":
-                depth += 1
+            if c == "{": depth += 1
             elif c == "}":
                 depth -= 1
-                if depth == 0:
-                    return i
+                if depth == 0: return i
         i += 1
     return -1
 
 def parse_response(answer: str):
     charts = []
     clean_text = answer
-
-    fenced_pattern = re.compile(r'```(?:chart|json)?\s*\n?([\s\S]*?)```', re.MULTILINE)
-
+    fenced = re.compile(r'```(?:chart|json)?\s*\n?([\s\S]*?)```', re.MULTILINE)
     def _replace(m):
-        data = _try_parse_chart(m.group(1))
-        if data:
-            charts.append(data)
-            return ""
+        d = _try_parse_chart(m.group(1))
+        if d:
+            charts.append(d); return ""
         return m.group(0)
-
-    clean_text = fenced_pattern.sub(_replace, clean_text)
-
+    clean_text = fenced.sub(_replace, clean_text)
     i = 0
     while i < len(clean_text):
         if clean_text[i] == "{":
             end = _find_matching_brace(clean_text, i)
             if end != -1:
-                data = _try_parse_chart(clean_text[i:end + 1])
-                if data:
-                    charts.append(data)
+                d = _try_parse_chart(clean_text[i:end + 1])
+                if d:
+                    charts.append(d)
                     clean_text = clean_text[:i] + clean_text[end + 1:]
                     continue
         i += 1
-
     clean_text = clean_text.strip()
     if charts and clean_text == "The provided model artifacts do not contain this information.":
         clean_text = ""
@@ -468,13 +431,10 @@ def parse_response(answer: str):
 # =============================================================================
 def _pie_is_valid(values) -> bool:
     vals = [float(v) for v in values if v is not None]
-    if not vals:
-        return False
+    if not vals: return False
     s = sum(vals)
-    if 50 <= s <= 105:
-        return True
-    if 0.9 <= s <= 1.1 and all(v <= 1.05 for v in vals):
-        return True
+    if 50 <= s <= 105: return True
+    if 0.9 <= s <= 1.1 and all(v <= 1.05 for v in vals): return True
     return False
 
 def render_chart(chart_data):
@@ -486,7 +446,6 @@ def render_chart(chart_data):
 
     if chart_type == "pie" and not _pie_is_valid(df["value"].tolist()):
         chart_type = "bar"
-
     if chart_type in ("bar", "line"):
         df = df.sort_values("value", ascending=False).reset_index(drop=True)
 
@@ -499,34 +458,49 @@ def render_chart(chart_data):
     elif chart_type == "line":
         chart = alt.Chart(df).mark_line(point=True).encode(
             x=alt.X("label:N", title=x_title, sort=df["label"].tolist(), axis=alt.Axis(labelAngle=-45)),
-            y=alt.Y("value:Q", title=y_title),
-            tooltip=["label", "value"],
+            y=alt.Y("value:Q", title=y_title), tooltip=["label", "value"],
         ).properties(title=title)
     elif chart_type == "scatter":
-        base = alt.Chart(df).encode(
-            x=alt.X("x:Q", title=x_title),
-            y=alt.Y("y:Q", title=y_title),
-        )
+        base = alt.Chart(df).encode(x=alt.X("x:Q", title=x_title), y=alt.Y("y:Q", title=y_title))
         points = base.mark_circle(size=120).encode(tooltip=["label", "x", "y"])
         labels = base.mark_text(align="left", dx=8, dy=-8).encode(text="label:N")
         chart = (points + labels).properties(title=title)
     else:
         chart = alt.Chart(df).mark_bar().encode(
             x=alt.X("label:N", title=x_title, sort=df["label"].tolist(), axis=alt.Axis(labelAngle=-45)),
-            y=alt.Y("value:Q", title=y_title),
-            tooltip=["label", "value"],
+            y=alt.Y("value:Q", title=y_title), tooltip=["label", "value"],
         ).properties(title=title)
-
     st.altair_chart(chart, use_container_width=True)
 
 # =============================================================================
 # UI
 # =============================================================================
 st.title("🛫 Airline Satisfaction RAG")
-st.caption("Ask questions grounded in coefficients, SHAP, and what-if analysis. Try asking for a pie chart!")
+st.caption("Ask questions grounded in coefficients, SHAP, and what-if analysis.")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "usage" not in st.session_state:
+    st.session_state.usage = {"prompt": 0, "completion": 0, "total": 0}
+
+# FIX 14 / 16: sidebar
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    st.session_state.bypass_cache = st.checkbox(
+        "Force fresh response (bypass cache)", value=False,
+        help="Skips cached answers. Use for consistency tests. Costs tokens.",
+    )
+    if st.button("Clear chat + reset usage", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.usage = {"prompt": 0, "completion": 0, "total": 0}
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("### 📊 Session usage")
+    st.metric("Total tokens", f"{st.session_state.usage['total']:,}")
+    st.caption(f"Prompt: {st.session_state.usage['prompt']:,} · Completion: {st.session_state.usage['completion']:,}")
+    st.caption(f"Est. remaining (200k cap): **{max(0, 200_000 - st.session_state.usage['total']):,}**")
+    st.caption("Free tier reset: daily. Check [console.groq.com](https://console.groq.com/settings/billing).")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -538,12 +512,11 @@ for msg in st.session_state.messages:
         if msg.get("sources"):
             with st.expander(f"Sources ({len(msg['sources'])})"):
                 for s in msg["sources"]:
-                    score = s.get("raw_score", s.get("score", 0.0))
-                    st.markdown(f"**{s['title']}** (`{s['type']}`) — raw cosine {score:.3f}")
+                    sc = s.get("raw_score", s.get("score", 0.0))
+                    st.markdown(f"**{s['title']}** (`{s['type']}`) — raw cosine {sc:.3f}")
 
 def process(q: str):
     history = st.session_state.messages[-2 * HISTORY_TURNS:]
-
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.markdown(q)
@@ -553,7 +526,6 @@ def process(q: str):
             raw_answer, retrieved, _ = ask(q, history=history)
             clean_text, charts = parse_response(raw_answer)
             clean_text = apply_verification(clean_text, retrieved)
-
             if clean_text:
                 st.markdown(clean_text)
             for c in charts:
@@ -561,14 +533,11 @@ def process(q: str):
             if retrieved:
                 with st.expander(f"Sources ({len(retrieved)})"):
                     for c in retrieved:
-                        score = c.get("raw_score", c.get("score", 0.0))
-                        st.markdown(f"**{c['title']}** (`{c['type']}`) — raw cosine {score:.3f}")
-
+                        sc = c.get("raw_score", c.get("score", 0.0))
+                        st.markdown(f"**{c['title']}** (`{c['type']}`) — raw cosine {sc:.3f}")
             st.session_state.messages.append({
-                "role": "assistant",
-                "content": clean_text,
-                "charts": charts,
-                "sources": retrieved,
+                "role": "assistant", "content": clean_text,
+                "charts": charts, "sources": retrieved,
             })
 
 if user_q := st.chat_input("Ask anything... (e.g., 'generate a bar chart of the what-if levers')"):
