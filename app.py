@@ -10,7 +10,7 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 
 # =============================================================================
-# CONFIG  (FIX 15: token budget reduction)
+# CONFIG
 # =============================================================================
 st.set_page_config(page_title="Airline Satisfaction RAG", page_icon="🛫", layout="wide")
 
@@ -23,25 +23,34 @@ if not os.path.exists("./embeddings/embeddings.npy") or not os.path.exists("./em
     st.error("🚨 **Missing Files:** could not find ./embeddings/ folder.")
     st.stop()
 
-MODEL = "openai/gpt-oss-20b"
-TOP_K = 4                    # FIX 15: was 6
+# MODELS — configurable via secrets, defaults chosen for reasoning quality
+LLM_MODEL = st.secrets.get("LLM_MODEL", "llama-3.3-70b-versatile")
+EMBED_MODEL = st.secrets.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+TOP_K = 4
 MIN_RAW_SIM = 0.10
-HISTORY_TURNS = 2            # FIX 15: was 4
-HISTORY_MSG_CHARS = 500      # FIX 15: was 1200
-MAX_TOKENS_DEFAULT = 800     # FIX 15: was 1500
-MAX_TOKENS_VISUAL = 2000     # FIX 15: was 3000
+HISTORY_TURNS = 2
+HISTORY_MSG_CHARS = 500
+MAX_TOKENS_DEFAULT = 800
+MAX_TOKENS_VISUAL = 2000
 INTENT_BOOST_MULT = 2.0
 INTENT_BOOST_ADD = 0.20
 REPORT_PENALTY = 0.15
-MAX_RETRIES = 2              # FIX 13
-MAX_WAIT_SECONDS = 120       # FIX 13
+MAX_RETRIES = 2
+MAX_WAIT_SECONDS = 120
+
+# Self-check triggers — only for adversarial/pushback queries (2× tokens for these)
+SELF_CHECK_TRIGGERS = (
+    "confirm", "prove", "proves", "right?", "correct?", "is that true",
+    "definitely", "always", "never", "guarantee", "means that", "so we should",
+)
 
 # =============================================================================
-# BACKEND LOAD
+# BACKEND
 # =============================================================================
 @st.cache_resource
 def load_backend():
-    embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    embedder = SentenceTransformer(EMBED_MODEL)
     embeddings = np.load("./embeddings/embeddings.npy")
     with open("./embeddings/chunks.json") as f:
         chunks = json.load(f)
@@ -52,7 +61,7 @@ embedder, EMBEDDINGS, CHUNKS, groq_client = load_backend()
 EMBEDDINGS_NORM = EMBEDDINGS / (np.linalg.norm(EMBEDDINGS, axis=1, keepdims=True) + 1e-9)
 
 # =============================================================================
-# SYSTEM PROMPT  (FIX 15: compressed ~900 → ~380 tokens)
+# SYSTEM PROMPT
 # =============================================================================
 SYSTEM_PROMPT = "\n".join([
     "You are a senior data science consultant for an airline passenger satisfaction model.",
@@ -61,25 +70,51 @@ SYSTEM_PROMPT = "\n".join([
     "",
     "GROUNDING: use ONLY facts in CONTEXT. If not in CONTEXT: reply exactly 'The provided model artifacts do not contain this information.'",
     "",
+    "PUSHBACK — CRITICAL RULES:",
+    "1. Do NOT confirm a false premise just because part of it is technically true. If the user's claim is partially right and partially wrong, state clearly what IS supported and what IS NOT.",
+    "2. If the user states a number that contradicts CONTEXT, correct it with the CONTEXT value and cite it. Never compute on user-supplied numbers unless they match CONTEXT.",
+    "3. If the user asks you to 'confirm' or 'prove' something, evaluate whether the artifacts actually support it — do not assume the claim is true.",
+    "",
+    "AGGREGATE FEATURES: Service Mean, Service Std, and Service Min are AGGREGATES across the 33 raw ratings. A coefficient on an aggregate does NOT describe a single-rating change. If the user claims a coefficient implies a single-rating effect, refuse and explain the distinction.",
+    "",
+    "CAUSALITY: SHAP values are model attributions, not causal effects. Do NOT claim a feature 'causes' satisfaction, that 'fixing X will raise satisfaction', or that the model 'proves' anything causal. Cite [Limitations & Caveats]. Associations require pilots to confirm.",
+    "",
+    "STATISTICAL SCALE: At n≈700k, all coefficients are statistically significant. Significance ≠ importance. Prioritize by effect size (coefficient magnitude, OR, lift), not by p-value alone. If asked which levers are 'significant', state that all are significant at this sample size and effect size is what matters.",
+    "",
+    "MODEL A vs MODEL B: Model A (predictive) uses all 33 raw ratings. Model B (interpretive) EXCLUDES raw ratings but INCLUDES aggregate statistics (mean/std/min of ratings) AND non-rating categorical features (Customer Type, Type of Travel, Class, etc.).",
+    "",
     "MEMORY: assistant turns include '(Chart N: title — label=value)' summaries. If user references a chart that doesn't exist, name what exists and explain instead of refusing.",
     "",
-    "CHART REFS: in prose use 'Chart 1' — NEVER square brackets. Brackets are citations only. '[Chart 1: title]' is WRONG.",
+    "CHART REFS: in prose use 'Chart 1' — NEVER square brackets. Brackets are citations only.",
     "",
     "RANKING: never call a lever 'highest lift' if another has larger lift. State criterion (lift-per-cost or raw-lift). Wi-Fi=+5.37pp raw, Online Boarding=+4.99pp raw but #1 on lift-per-cost. Never imply Online Boarding has higher raw lift.",
     "",
     "CROSS-METRIC: do NOT compare odds ratio to mean |SHAP| (different scales). Refuse OR↔SHAP; offer OR↔OR or SHAP↔SHAP.",
     "",
-    "SCATTER: list EVERY feature appearing in BOTH retrieved chunks. Never claim 'only N have both metrics' without verification. Convention: x=mean|SHAP|, y=odds ratio.",
+    "SCATTER: list EVERY feature appearing in BOTH retrieved chunks. Convention: x=mean|SHAP|, y=odds ratio.",
     "",
-    "CHART TYPE: bar for unordered categories. line only for ordered axes (time, delay buckets, coefficient rank). If user requests line for unordered, provide + one sentence caveat. Pie coerced to bar if values aren't compositional.",
+    "CHART TYPE: bar for unordered categories. line only for ordered axes. Pie coerced to bar if values aren't compositional.",
     "",
     "FILES: cannot produce files. Say 'I can't generate files, but here is a slide-ready content outline:' then provide outline + chart JSON.",
     "",
     "CHART FORMAT: wrap JSON in ```chart ... ```. Types: bar, line, pie, scatter. Bar/line/pie rows: {label, value}. Scatter rows: {label, x, y}.",
     "",
-    "CITATIONS: after each factual sentence add [Chunk Title]. No CJK brackets, no [Chart N], no (Source: X).",
+    "CITATIONS: after each factual sentence add [Chunk Title]. No CJK brackets, no [Chart N], no (Source: X)."
+])
+
+SELF_CHECK_PROMPT = "\n".join([
+    "You are auditing a proposed answer for statistical integrity. You have the original question, the proposed answer, and the CONTEXT chunks the answer was based on.",
     "",
-    "MODEL A: all 33 raw ratings. MODEL B: only aggregates, no raw ratings."
+    "Check the proposed answer for these FAILURES:",
+    "1. CONFIRMING A FALSE PREMISE — did the answer say 'yes' / 'confirmed' / 'exactly' to a claim that the CONTEXT does not support?",
+    "2. CAUSAL OVERCLAIM — did the answer say a feature 'causes', 'proves', 'guarantees', or 'will definitely raise' satisfaction? SHAP is attribution, not causation.",
+    "3. AGGREGATE CONFLATION — did the answer treat Service Mean/Std/Min as if they describe single-rating effects?",
+    "4. ACCEPTED FALSE NUMBERS — did the answer use a number the user provided that is NOT in CONTEXT?",
+    "5. MISSING CITATIONS — does any factual claim lack a [Chunk Title]?",
+    "",
+    "If any failure is present: REWRITE the answer to fix it, refuse the false premise, and cite the correct evidence.",
+    "If no failures: return the answer UNCHANGED.",
+    "Return ONLY the final answer text (no audit commentary)."
 ])
 
 USER_TEMPLATE = "\n".join([
@@ -95,13 +130,13 @@ USER_TEMPLATE = "\n".join([
 # INTENT & RETRIEVAL
 # =============================================================================
 INTENT_KEYWORDS = {
-    "caveats": ["limitation", "caveat", "risk", "weakness", "problem"],
+    "caveats": ["limitation", "caveat", "risk", "weakness", "problem", "significant", "causal", "synthetic"],
     "business_levers": ["lever", "priority", "impact", "what-if", "improve"],
     "segments": ["segment", "cohort", "business traveler", "loyal"],
-    "model_summary": ["auc", "accuracy", "score", "brier", "dataset", "rows"],
-    "methodology": ["method", "trained", "halo", "collinear", "two models"],
+    "model_summary": ["auc", "accuracy", "score", "brier", "dataset", "rows", "test"],
+    "methodology": ["method", "trained", "halo", "collinear", "two models", "regulariz"],
     "feature_importance": ["shap", "importance", "driver"],
-    "coefficients": ["coefficient", "odds ratio", "odds"],
+    "coefficients": ["coefficient", "odds ratio", "odds", "p-value", "p value", "significant"],
     "recommendations": ["recommend", "suggest", "what to do"],
 }
 
@@ -246,22 +281,23 @@ def apply_verification(text: str, retrieved: list) -> str:
     return text
 
 # =============================================================================
-# FIX 13 / 16: Groq call with retry + usage tracking
+# GROQ CALL WITH RETRY
 # =============================================================================
 def _track_usage(resp):
     if hasattr(resp, "usage") and resp.usage:
         u = resp.usage
-        st.session_state.setdefault("usage", {"prompt": 0, "completion": 0, "total": 0})
+        st.session_state.setdefault("usage", {"prompt": 0, "completion": 0, "total": 0, "calls": 0})
         st.session_state.usage["prompt"] += getattr(u, "prompt_tokens", 0) or 0
         st.session_state.usage["completion"] += getattr(u, "completion_tokens", 0) or 0
         st.session_state.usage["total"] += getattr(u, "total_tokens", 0) or 0
+        st.session_state.usage["calls"] += 1
 
 def _groq_call(messages, max_tok):
     last_err = None
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = groq_client.chat.completions.create(
-                model=MODEL, messages=messages, temperature=0.2, max_tokens=max_tok,
+                model=LLM_MODEL, messages=messages, temperature=0.2, max_tokens=max_tok,
             )
             _track_usage(resp)
             return resp
@@ -284,6 +320,10 @@ def _groq_call(messages, max_tok):
 # =============================================================================
 # CORE ASK
 # =============================================================================
+def _needs_self_check(question: str) -> bool:
+    q = question.lower()
+    return any(tok in q for tok in SELF_CHECK_TRIGGERS)
+
 def _ask_impl(question: str, history: list):
     search_q = build_search_query(question, history)
     is_visual_query = any(kw in question.lower() for kw in ["chart", "plot", "graph", "visual", "ppt", "presentation"])
@@ -320,22 +360,38 @@ def _ask_impl(question: str, history: list):
         if str(e).startswith("RATE_LIMIT_LONG:"):
             wait_s = int(str(e).split(":")[1])
             mins = max(1, wait_s // 60)
-            used = st.session_state.get("usage", {}).get("total", 0)
-            return (f"⏳ **Groq daily token limit reached.** Retry in ~{mins} min, "
-                    f"or upgrade at https://console.groq.com/settings/billing. "
-                    f"Session usage: **{used:,}** tokens."), [], False
+            return (f"⏳ **Groq daily token limit reached.** Retry in ~{mins} min. "
+                    f"This is **account-level** (200k/day), not session. "
+                    f"Upgrade: https://console.groq.com/settings/billing"), [], False
         return f"LLM error: {e}", [], False
     except Exception as e:
         err = str(e)
         if "429" in err or "rate_limit" in err.lower():
-            used = st.session_state.get("usage", {}).get("total", 0)
-            return (f"⏳ **Groq rate limit hit.** Session usage: **{used:,}** tokens. "
-                    f"Check https://console.groq.com/settings/billing for reset time."), [], False
+            return (f"⏳ **Groq rate limit hit.** Check account-level reset at "
+                    f"https://console.groq.com/settings/billing"), [], False
         return f"LLM error: {e}", [], False
+
+    # Self-check only for adversarial queries — doubles tokens on those
+    if _needs_self_check(question) and not is_visual_query:
+        try:
+            check_msgs = [
+                {"role": "system", "content": SELF_CHECK_PROMPT},
+                {"role": "user", "content": (
+                    f"ORIGINAL QUESTION:\n{question}\n\n"
+                    f"PROPOSED ANSWER:\n{answer}\n\n"
+                    f"CONTEXT:\n{context[:4000]}\n\n"
+                    f"Rewrite or return unchanged per instructions."
+                )},
+            ]
+            check_resp = _groq_call(check_msgs, max_tok)
+            revised = check_resp.choices[0].message.content or answer
+            if revised.strip():
+                answer = revised
+        except Exception:
+            pass  # self-check failure → keep original answer
 
     return normalize_citations(answer), retrieved, is_visual_query
 
-# FIX 14: cache empty-history asks (identical questions = 0 tokens)
 @st.cache_data(ttl=3600, max_entries=50, show_spinner=False)
 def _cached_ask(question: str):
     return _ask_impl(question, [])
@@ -481,24 +537,34 @@ st.caption("Ask questions grounded in coefficients, SHAP, and what-if analysis."
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "usage" not in st.session_state:
-    st.session_state.usage = {"prompt": 0, "completion": 0, "total": 0}
+    st.session_state.usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
 
-# FIX 14 / 16: sidebar
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
     st.session_state.bypass_cache = st.checkbox(
         "Force fresh response (bypass cache)", value=False,
-        help="Skips cached answers. Use for consistency tests. Costs tokens.",
+        help="Skips cached answers. Costs tokens. Use for consistency tests.",
     )
     if st.button("Clear chat + reset usage", use_container_width=True):
         st.session_state.messages = []
-        st.session_state.usage = {"prompt": 0, "completion": 0, "total": 0}
+        st.session_state.usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
         st.cache_data.clear()
         st.rerun()
 
+    st.markdown("### 🔧 Model config")
+    st.caption(f"LLM: `{LLM_MODEL}`")
+    st.caption(f"Embedding: `{EMBED_MODEL.split('/')[-1]}`")
+    st.caption(f"TOP_K: {TOP_K} · Self-check: {'on' if _needs_self_check else 'auto'}")
+
     st.markdown("### 📊 Session usage")
     st.metric("Total tokens", f"{st.session_state.usage['total']:,}")
-    st.caption(f"Prompt: {st.session_state.usage['prompt']:,} · Completion: {st.session_state.usage['completion']:,}")
+    st.caption(
+        f"Prompt: {st.session_state.usage['prompt']:,} · "
+        f"Completion: {st.session_state.usage['completion']:,} · "
+        f"Calls: {st.session_state.usage['calls']}"
+    )
+    avg = st.session_state.usage['total'] / max(1, st.session_state.usage['calls'])
+    st.caption(f"Avg cost/call: **{avg:,.0f}** tokens")
     st.caption(f"Est. remaining (200k cap): **{max(0, 200_000 - st.session_state.usage['total']):,}**")
     st.caption("Free tier reset: daily. Check [console.groq.com](https://console.groq.com/settings/billing).")
 
