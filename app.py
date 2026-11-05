@@ -38,6 +38,7 @@ HISTORY_TURNS = 2
 HISTORY_MSG_CHARS = 500
 MAX_TOKENS_DEFAULT = 800
 MAX_TOKENS_VISUAL = 2000
+MAX_TOKENS_EXHAUSTIVE = 3500      # FIX 27
 INTENT_BOOST_MULT = 2.0
 INTENT_BOOST_ADD = 0.20
 REPORT_PENALTY = 0.15
@@ -51,6 +52,11 @@ SELF_CHECK_TRIGGERS = (
 
 META_FOLLOWUPS = ("why", "why?", "explain", "how come", "what do you mean",
                   "what?", "huh", "why not", "why not?", "which", "how")
+
+EXHAUSTIVE_TRIGGERS = (           # FIX 27
+    "all plots", "all charts", "every chart", "every plot",
+    "in one go", "maximum charts", "generate everything",
+)
 
 # =============================================================================
 # BACKEND + MODEL RESOLUTION
@@ -88,7 +94,7 @@ if LLM_MODEL is None:
     st.stop()
 
 # =============================================================================
-# SYSTEM PROMPT  (FIX 22 + 23: chart data / chart output rules)
+# SYSTEM PROMPT  (FIX 26: explicit correction; FIX 25 prompt hint)
 # =============================================================================
 SYSTEM_PROMPT = "\n".join([
     "You are a senior data science consultant for an airline passenger satisfaction model.",
@@ -99,7 +105,7 @@ SYSTEM_PROMPT = "\n".join([
     "",
     "PUSHBACK — CRITICAL:",
     "1. Do NOT confirm a false premise because part of it is technically true. State what IS supported and what IS NOT.",
-    "2. If the user states a number that contradicts CONTEXT, CORRECT it: 'That figure differs from the artifacts; the correct value is X [Chunk].' Then answer using the correct value. Do NOT refuse unless no relevant artifact exists.",
+    "2. If the user states a number that contradicts CONTEXT, CORRECT it EXPLICITLY: 'That figure differs from the artifacts; the correct value is X [Chunk].' Do NOT silently substitute a different number — say the user's number is wrong.",
     "3. If asked to 'confirm' or 'prove', evaluate whether the artifacts support the claim — don't assume true.",
     "",
     "AGGREGATE FEATURES: Service Mean, Service Std, Service Min are AGGREGATES across 33 raw ratings. Their coefficients do NOT describe single-rating effects. If a user claims otherwise, refuse and explain.",
@@ -126,13 +132,13 @@ SYSTEM_PROMPT = "\n".join([
     "",
     "CHART OUTPUT: emit each chart exactly ONCE, inside a single ```chart block. Do NOT repeat the data as raw JSON after the fenced block. For multiple charts, emit MULTIPLE separate ```chart blocks — do NOT wrap them in a {\"charts\": [...]} object.",
     "",
+    "CHART FORMAT: wrap JSON in ```chart ... ```. Types: bar, line, pie, scatter. BOTH top-level keys are REQUIRED: \"type\" AND \"data\". Bar/line/pie: {\"type\": \"bar\", \"data\": [{\"label\": str, \"value\": number}]}. Scatter: {\"type\": \"scatter\", \"data\": [{\"label\": str, \"x\": number, \"y\": number}]}. Do NOT omit \"type\".",
+    "",
     "CAPABILITY QUESTIONS: if user asks 'what can you do', 'what charts can you build', 'what plots are available' — describe in PROSE only. Do NOT emit chart JSON unless they ask for a specific chart.",
     "",
     "REFUSAL FOLLOWUPS: if the previous turn was a refusal and the user asks 'why' / 'explain', explain what specific artifact or data is MISSING — name the exact data type required. Do NOT switch to a different topic from earlier in the conversation.",
     "",
     "FILES: cannot produce files. Say 'I can't generate files, but here is a slide-ready content outline:' then provide outline + chart JSON.",
-    "",
-    "CHART FORMAT: wrap JSON in ```chart ... ```. Types: bar, line, pie, scatter. The top-level key MUST be \"data\" (not \"rows\"). Bar/line/pie: {\"data\": [{\"label\": str, \"value\": number}]}. Scatter: {\"data\": [{\"label\": str, \"x\": number, \"y\": number}]}.",
     "",
     "CITATIONS: after each factual sentence add [Chunk Title]. No CJK brackets, no [Chart N], no (Source: X)."
 ])
@@ -144,8 +150,9 @@ SELF_CHECK_PROMPT = "\n".join([
     "1. CONFIRMING A FALSE PREMISE — did the answer say 'yes' / 'confirmed' / 'exactly' to a claim CONTEXT doesn't support?",
     "2. CAUSAL OVERCLAIM — did it say a feature 'causes', 'proves', 'guarantees', or 'will definitely raise' satisfaction?",
     "3. AGGREGATE CONFLATION — did it treat Service Mean/Std/Min as if single-rating effects?",
-    "4. ACCEPTED FALSE NUMBERS — did it use a user-provided number that isn't in CONTEXT? Correct it instead.",
+    "4. ACCEPTED FALSE NUMBERS — did it use a user-provided number that isn't in CONTEXT? Correct it EXPLICITLY (say 'that figure differs from the artifacts') — do not silently substitute.",
     "5. MISSING CITATIONS — does any factual claim lack [Chunk Title]?",
+    "6. UNIT TRANSLATION — did it claim an odds ratio of X implies an X% probability change?",
     "",
     "If any failure: REWRITE the answer to fix it. If no failures: return UNCHANGED. Return ONLY the answer text."
 ])
@@ -318,7 +325,7 @@ def apply_verification(text: str, retrieved: list) -> str:
     unverified = verify_numbers(text, retrieved)
     if unverified:
         warnings.append(f"⚠️ **Unverified figures:** {', '.join(sorted(set(unverified)))} — not found verbatim in retrieved chunks.")
-    bad = verify_citations(text, retrieved)
+    bad = verify_citations(answer=text, retrieved=retrieved)
     if bad:
         warnings.append(f"⚠️ **Uncited sources:** {', '.join(f'[{b}]' for b in sorted(set(bad)))} — not among retrieved chunks.")
     if warnings:
@@ -363,15 +370,20 @@ def _groq_call(messages, max_tok):
     raise last_err
 
 # =============================================================================
-# CORE ASK
+# CORE ASK  (FIX 27: exhaustive max_tokens)
 # =============================================================================
 def _needs_self_check(question: str) -> bool:
     q = question.lower()
     return any(tok in q for tok in SELF_CHECK_TRIGGERS)
 
+def _is_exhaustive(question: str) -> bool:
+    q = question.lower()
+    return any(tok in q for tok in EXHAUSTIVE_TRIGGERS)
+
 def _ask_impl(question: str, history: list):
     search_q = build_search_query(question, history)
     is_visual_query = any(kw in question.lower() for kw in ["chart", "plot", "graph", "visual", "ppt", "presentation"])
+    is_exhaustive = _is_exhaustive(question)
 
     retrieved = []
     meta_mode = (search_q == "")
@@ -407,7 +419,13 @@ def _ask_impl(question: str, history: list):
             messages.append({"role": m["role"], "content": content[:HISTORY_MSG_CHARS]})
 
     messages.append({"role": "user", "content": USER_TEMPLATE.format(context=context, question=question)})
-    max_tok = MAX_TOKENS_VISUAL if is_visual_query else MAX_TOKENS_DEFAULT
+
+    if is_exhaustive:
+        max_tok = MAX_TOKENS_EXHAUSTIVE
+    elif is_visual_query:
+        max_tok = MAX_TOKENS_VISUAL
+    else:
+        max_tok = MAX_TOKENS_DEFAULT
 
     try:
         resp = _groq_call(messages, max_tok)
@@ -457,7 +475,7 @@ def ask(question: str, history=None):
     return _ask_impl(question, history)
 
 # =============================================================================
-# PARSER  (FIX 24: {"charts": [...]} wrapper flattening)
+# PARSER  (FIX 25: default type to bar if absent)
 # =============================================================================
 def _try_parse_chart(raw: str):
     raw = raw.strip()
@@ -470,24 +488,28 @@ def _try_parse_chart(raw: str):
     if not isinstance(data, dict):
         return None
 
-    # FIX 24a: unwrap {"charts": [...]} — return first inner, caller handles multi
+    # FIX 24a: unwrap {"charts": [...]}
     if "charts" in data and isinstance(data["charts"], list) and "type" not in data:
-        # Return a sentinel indicating a wrapper — caller must iterate
         return {"__wrapper__": True, "charts": data["charts"]}
 
-    # FIX 1a: accept alternate top-level keys for the data array
+    # FIX 1a: alias for data array
     if "data" not in data:
         for alias in ("rows", "items", "values", "entries"):
             if alias in data and isinstance(data[alias], list):
                 data["data"] = data.pop(alias)
                 break
 
-    if "data" not in data or "type" not in data:
+    if "data" not in data:
         return None
+
+    # FIX 25: default type to "bar" if missing
+    if "type" not in data:
+        data["type"] = "bar"
+
     if not isinstance(data["data"], list) or not data["data"]:
         return None
 
-    # FIX 1b: accept name→label aliasing inside rows
+    # FIX 1b: name→label aliasing inside rows
     for row in data["data"]:
         if isinstance(row, dict) and "label" not in row:
             if "name" in row:
@@ -525,7 +547,6 @@ def _try_parse_chart(raw: str):
     return data
 
 def _try_parse_chart_multi(raw: str) -> list:
-    """Parse a raw JSON string into a list of chart dicts. Handles wrappers."""
     result = _try_parse_chart(raw)
     if result is None:
         return []
@@ -533,8 +554,7 @@ def _try_parse_chart_multi(raw: str) -> list:
         out = []
         for inner in result.get("charts", []):
             if isinstance(inner, dict):
-                inner_str = json.dumps(inner)
-                parsed = _try_parse_chart(inner_str)
+                parsed = _try_parse_chart(json.dumps(inner))
                 if parsed and not (isinstance(parsed, dict) and parsed.get("__wrapper__")):
                     out.append(parsed)
         return out
@@ -571,7 +591,6 @@ def parse_response(answer: str):
 
     clean_text = fenced.sub(_replace, clean_text)
 
-    # Unfenced fallback — scan for bare JSON objects
     i = 0
     while i < len(clean_text):
         if clean_text[i] == "{":
