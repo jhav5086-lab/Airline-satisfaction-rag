@@ -24,11 +24,11 @@ if not os.path.exists("./embeddings/embeddings.npy") or not os.path.exists("./em
 
 MODEL = "openai/gpt-oss-20b"
 TOP_K = 6
-MIN_RAW_SIM = 0.10              # FIX 5: reverted from 0.20
+MIN_RAW_SIM = 0.10
 HISTORY_TURNS = 4
 MAX_TOKENS_DEFAULT = 1500
 MAX_TOKENS_VISUAL = 3000
-INTENT_BOOST_MULT = 2.0         # FIX 7: multiplicative boost
+INTENT_BOOST_MULT = 2.0
 INTENT_BOOST_ADD = 0.20
 REPORT_PENALTY = 0.15
 
@@ -48,7 +48,7 @@ embedder, EMBEDDINGS, CHUNKS, groq_client = load_backend()
 EMBEDDINGS_NORM = EMBEDDINGS / (np.linalg.norm(EMBEDDINGS, axis=1, keepdims=True) + 1e-9)
 
 # =============================================================================
-# SYSTEM PROMPT
+# SYSTEM PROMPT  (FIX 9/10/11/12: chart refs, scatter, files, chart types)
 # =============================================================================
 SYSTEM_PROMPT = "\n".join([
     "You are a dynamic senior data science consultant for an airline passenger satisfaction model.",
@@ -64,9 +64,15 @@ SYSTEM_PROMPT = "\n".join([
     "- If a factual question is not in CONTEXT: reply exactly 'The provided model artifacts do not contain this information.'",
     "",
     "## CONVERSATION MEMORY",
-    "- Assistant turns include chart summaries of the form '[Chart N: title — label=value, ...]'.",
-    "- When the user says 'previous chart', 'that chart', 'it', or similar, refer to chart summaries in conversation history.",
+    "- Assistant turns include chart summaries of the form '(Chart N: title — label=value, ...)'.",
+    "- When the user says 'previous chart', 'that chart', 'it', or similar, refer to those summaries.",
     "- If the user references a chart that does not exist (e.g., 'previous to previous' when only one chart has been made), acknowledge the reference, name the available chart(s), and explain what you have instead of refusing.",
+    "",
+    "## CHART REFERENCES IN PROSE (CRITICAL)",
+    "- When you refer to a chart in your answer, write 'Chart 1' or 'the bar chart' — NEVER wrap it in square brackets.",
+    "- Square brackets [Title] are reserved for SOURCE CITATIONS only.",
+    "- Example: 'Chart 1 shows the top SHAP drivers [Top 10 SHAP Drivers].' — correct.",
+    "- Example: '[Chart 1: SHAP Drivers]' — WRONG, this is not a citation.",
     "",
     "## RANKING RULES (CRITICAL)",
     "- Never call a lever 'highest lift' if another lever in CONTEXT has a larger numeric lift.",
@@ -77,6 +83,20 @@ SYSTEM_PROMPT = "\n".join([
     "- Do NOT compare an odds ratio to a mean |SHAP| value — different scales and meanings.",
     "- Compare like-with-like: OR vs coefficient, or SHAP vs SHAP.",
     "- If the user asks for an OR-vs-SHAP comparison, state the incompatibility and offer the correct comparison instead.",
+    "",
+    "## SCATTER / CROSS-METRIC CHARTS (CRITICAL)",
+    "- When asked to plot SHAP vs odds ratio, list EVERY feature that appears in BOTH retrieved chunks (SHAP chunk and coefficient chunk).",
+    "- Never omit features silently. If a feature is in SHAP but not in the coefficient chunk, note it as 'no OR available'.",
+    "- Never state 'only N features have both metrics' unless you have verified each feature against both chunks.",
+    "- Scatter convention: x = mean |SHAP|, y = odds ratio. Do not swap axes between turns.",
+    "",
+    "## CHART TYPE GUIDANCE",
+    "- Use bar charts for unordered categories: levers, segments, feature names.",
+    "- Only use line charts for ordered axes: time, delay buckets (short/medium/long), coefficient rank.",
+    "- If the user explicitly requests a line chart for unordered categories, provide it but add one sentence: 'Note: a bar chart is more appropriate for unordered categories.'",
+    "",
+    "## FILE OUTPUT",
+    "- If the user asks for a PPT, PDF, Excel, or other file, say: 'I can\\'t generate files, but here is a slide-ready content outline:' — then provide the outline plus chart JSON blocks.",
     "",
     "## CHART FORMAT (CRITICAL)",
     "You MUST wrap the JSON in triple backticks. Do NOT forget the opening `{` and closing `}`.",
@@ -97,7 +117,7 @@ SYSTEM_PROMPT = "\n".join([
     "",
     "## CITATIONS - STRICT FORMAT",
     "- After each factual sentence (except in chart blocks), add ONE citation: [Chunk Title]",
-    "- FORBIDDEN: CJK brackets, dagger-L tokens, '(Source: X)'.",
+    "- FORBIDDEN: CJK brackets, dagger-L tokens, '(Source: X)', and bracketed chart references like [Chart 1].",
     "",
     "## MODEL A vs MODEL B",
     "- Model A (predictive): uses ALL 33 raw service ratings.",
@@ -163,7 +183,6 @@ def retrieve(query: str, top_k: int = TOP_K):
     } for i in top_idx]
     return results, raw_max
 
-# FIX 6: ordinal chart reference
 def _get_chart_back(question: str) -> int:
     q = question.lower()
     back = 0
@@ -219,7 +238,7 @@ def normalize_citations(text: str) -> str:
     return text.strip()
 
 # =============================================================================
-# VERIFICATION
+# VERIFICATION  (FIX 9: skip [Chart ...] patterns)
 # =============================================================================
 NUM_PATTERN = re.compile(r'\b(\d{1,3}(?:,\d{3})+|\d+\.\d{3,}|\d{5,})\b')
 
@@ -247,7 +266,6 @@ def verify_numbers(answer: str, retrieved: list) -> list:
             unverified.append(raw)
     return unverified
 
-# FIX 7: normalized title comparison
 def _norm_title(t: str) -> str:
     t = re.sub(r"\s*\([^)]*\)", "", t)
     t = re.sub(r"[\s—–\-_]+", " ", t)
@@ -256,11 +274,13 @@ def _norm_title(t: str) -> str:
 def verify_citations(answer: str, retrieved: list) -> list:
     titles = {_norm_title(c["title"]) for c in retrieved}
     bad = []
-    # FIX 8: skip JSON-ish bracket contents
     for cite in re.findall(r"\[([^\]\[]+?)\]", answer):
         if "{" in cite or "}" in cite or '"' in cite:
             continue
         if re.fullmatch(r"[\d\s,;]+", cite):
+            continue
+        # FIX 9: chart references are not citations
+        if cite.lower().startswith("chart "):
             continue
         if _norm_title(cite) in titles:
             continue
@@ -284,7 +304,7 @@ def apply_verification(text: str, retrieved: list) -> str:
     return text
 
 # =============================================================================
-# CORE ASK
+# CORE ASK  (FIX 9: history chart summary uses parentheses)
 # =============================================================================
 def ask(question: str, history=None):
     if history is None:
@@ -297,7 +317,6 @@ def ask(question: str, history=None):
     )
     retrieved, raw_max = retrieve(search_q)
 
-    # FIX 5: skip gate when history exists (fixes A5 regression)
     if (
         not is_visual_query
         and not history
@@ -317,14 +336,14 @@ def ask(question: str, history=None):
     for m in history:
         content = m.get("content") or ""
         if m.get("charts"):
-            # FIX 6: numbered chart summaries so ordinals resolve
             summaries = []
             for idx, c in enumerate(m["charts"], 1):
                 pairs = ", ".join(
                     f"{d.get('label', '')}={d.get('value', d.get('x', ''))}"
                     for d in c.get("data", [])[:8]
                 )
-                summaries.append(f"[Chart {idx}: {c.get('title', 'chart')} — {pairs}]")
+                # FIX 9: parentheses, not brackets
+                summaries.append(f"(Chart {idx}: {c.get('title', 'chart')} — {pairs})")
             content = (content + "\n" + "\n".join(summaries)).strip()
         if content:
             messages.append({"role": m["role"], "content": content[:1200]})
@@ -351,7 +370,6 @@ def ask(question: str, history=None):
 # =============================================================================
 # PARSER
 # =============================================================================
-# FIX 8: scatter support
 def _try_parse_chart(raw: str):
     raw = raw.strip()
     if not raw.startswith("{") or not raw.endswith("}"):
