@@ -23,8 +23,15 @@ if not os.path.exists("./embeddings/embeddings.npy") or not os.path.exists("./em
     st.error("🚨 **Missing Files:** could not find ./embeddings/ folder.")
     st.stop()
 
-# MODELS — configurable via secrets, defaults chosen for reasoning quality
-LLM_MODEL = st.secrets.get("LLM_MODEL", "llama-3.3-70b-versatile")
+# FIX 21: model fallback chain — resolved against live API at startup
+MODEL_PREFERENCES = [
+    st.secrets.get("LLM_MODEL") if st.secrets.get("LLM_MODEL") else None,
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+]
+MODEL_PREFERENCES = [m for m in MODEL_PREFERENCES if m]  # drop None
+
 EMBED_MODEL = st.secrets.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
 TOP_K = 4
@@ -39,14 +46,13 @@ REPORT_PENALTY = 0.15
 MAX_RETRIES = 2
 MAX_WAIT_SECONDS = 120
 
-# Self-check triggers — only for adversarial/pushback queries (2× tokens for these)
 SELF_CHECK_TRIGGERS = (
     "confirm", "prove", "proves", "right?", "correct?", "is that true",
     "definitely", "always", "never", "guarantee", "means that", "so we should",
 )
 
 # =============================================================================
-# BACKEND
+# BACKEND + MODEL RESOLUTION
 # =============================================================================
 @st.cache_resource
 def load_backend():
@@ -57,8 +63,31 @@ def load_backend():
     groq_client = Groq(api_key=GROQ_API_KEY)
     return embedder, embeddings, chunks, groq_client
 
+@st.cache_resource
+def resolve_llm_model(_client, preferences: tuple):
+    """Try each preference against the live API. Return (model_id, available_models)."""
+    try:
+        available = {m.id for m in _client.models.list().data}
+    except Exception as e:
+        return None, [], f"Could not list models: {e}"
+    for m in preferences:
+        if m in available:
+            return m, sorted(available), None
+    return None, sorted(available), "None of the preferred models are available"
+
 embedder, EMBEDDINGS, CHUNKS, groq_client = load_backend()
 EMBEDDINGS_NORM = EMBEDDINGS / (np.linalg.norm(EMBEDDINGS, axis=1, keepdims=True) + 1e-9)
+
+LLM_MODEL, AVAILABLE_MODELS, MODEL_ERROR = resolve_llm_model(groq_client, tuple(MODEL_PREFERENCES))
+
+if LLM_MODEL is None:
+    st.error(f"🚨 **No usable LLM model found.** {MODEL_ERROR}")
+    if AVAILABLE_MODELS:
+        st.info("Your account has these models. Pick one and set `LLM_MODEL` in secrets:\n\n" +
+                "\n".join(f"- `{m}`" for m in AVAILABLE_MODELS))
+    else:
+        st.info("Could not query Groq model list. Check your API key at https://console.groq.com/keys")
+    st.stop()
 
 # =============================================================================
 # SYSTEM PROMPT
@@ -79,7 +108,7 @@ SYSTEM_PROMPT = "\n".join([
     "",
     "CAUSALITY: SHAP values are model attributions, not causal effects. Do NOT claim a feature 'causes' satisfaction, that 'fixing X will raise satisfaction', or that the model 'proves' anything causal. Cite [Limitations & Caveats]. Associations require pilots to confirm.",
     "",
-    "STATISTICAL SCALE: At n≈700k, all coefficients are statistically significant. Significance ≠ importance. Prioritize by effect size (coefficient magnitude, OR, lift), not by p-value alone. If asked which levers are 'significant', state that all are significant at this sample size and effect size is what matters.",
+    "STATISTICAL SCALE: At n≈700k, all coefficients are statistically significant. Significance ≠ importance. Prioritize by effect size (coefficient magnitude, OR, lift), not by p-value alone.",
     "",
     "MODEL A vs MODEL B: Model A (predictive) uses all 33 raw ratings. Model B (interpretive) EXCLUDES raw ratings but INCLUDES aggregate statistics (mean/std/min of ratings) AND non-rating categorical features (Customer Type, Type of Travel, Class, etc.).",
     "",
@@ -87,11 +116,11 @@ SYSTEM_PROMPT = "\n".join([
     "",
     "CHART REFS: in prose use 'Chart 1' — NEVER square brackets. Brackets are citations only.",
     "",
-    "RANKING: never call a lever 'highest lift' if another has larger lift. State criterion (lift-per-cost or raw-lift). Wi-Fi=+5.37pp raw, Online Boarding=+4.99pp raw but #1 on lift-per-cost. Never imply Online Boarding has higher raw lift.",
+    "RANKING: never call a lever 'highest lift' if another has larger lift. State criterion. Wi-Fi=+5.37pp raw, Online Boarding=+4.99pp raw but #1 on lift-per-cost. Never imply Online Boarding has higher raw lift.",
     "",
-    "CROSS-METRIC: do NOT compare odds ratio to mean |SHAP| (different scales). Refuse OR↔SHAP; offer OR↔OR or SHAP↔SHAP.",
+    "CROSS-METRIC: do NOT compare odds ratio to mean |SHAP|. Refuse OR↔SHAP; offer OR↔OR or SHAP↔SHAP.",
     "",
-    "SCATTER: list EVERY feature appearing in BOTH retrieved chunks. Convention: x=mean|SHAP|, y=odds ratio.",
+    "SCATTER: list EVERY feature appearing in BOTH retrieved chunks. x=mean|SHAP|, y=odds ratio.",
     "",
     "CHART TYPE: bar for unordered categories. line only for ordered axes. Pie coerced to bar if values aren't compositional.",
     "",
@@ -103,16 +132,16 @@ SYSTEM_PROMPT = "\n".join([
 ])
 
 SELF_CHECK_PROMPT = "\n".join([
-    "You are auditing a proposed answer for statistical integrity. You have the original question, the proposed answer, and the CONTEXT chunks the answer was based on.",
+    "You are auditing a proposed answer for statistical integrity.",
     "",
     "Check the proposed answer for these FAILURES:",
-    "1. CONFIRMING A FALSE PREMISE — did the answer say 'yes' / 'confirmed' / 'exactly' to a claim that the CONTEXT does not support?",
-    "2. CAUSAL OVERCLAIM — did the answer say a feature 'causes', 'proves', 'guarantees', or 'will definitely raise' satisfaction? SHAP is attribution, not causation.",
-    "3. AGGREGATE CONFLATION — did the answer treat Service Mean/Std/Min as if they describe single-rating effects?",
-    "4. ACCEPTED FALSE NUMBERS — did the answer use a number the user provided that is NOT in CONTEXT?",
-    "5. MISSING CITATIONS — does any factual claim lack a [Chunk Title]?",
+    "1. CONFIRMING A FALSE PREMISE — did the answer say 'yes' / 'confirmed' / 'exactly' to a claim that CONTEXT does not support?",
+    "2. CAUSAL OVERCLAIM — did it say a feature 'causes', 'proves', 'guarantees', or 'will definitely raise' satisfaction? SHAP is attribution.",
+    "3. AGGREGATE CONFLATION — did it treat Service Mean/Std/Min as if they describe single-rating effects?",
+    "4. ACCEPTED FALSE NUMBERS — did it use a number the user provided that is NOT in CONTEXT?",
+    "5. MISSING CITATIONS — does any factual claim lack [Chunk Title]?",
     "",
-    "If any failure is present: REWRITE the answer to fix it, refuse the false premise, and cite the correct evidence.",
+    "If any failure: REWRITE the answer to fix it, refuse the false premise, cite the correct evidence.",
     "If no failures: return the answer UNCHANGED.",
     "Return ONLY the final answer text (no audit commentary)."
 ])
@@ -281,7 +310,7 @@ def apply_verification(text: str, retrieved: list) -> str:
     return text
 
 # =============================================================================
-# GROQ CALL WITH RETRY
+# GROQ CALL
 # =============================================================================
 def _track_usage(resp):
     if hasattr(resp, "usage") and resp.usage:
@@ -361,17 +390,14 @@ def _ask_impl(question: str, history: list):
             wait_s = int(str(e).split(":")[1])
             mins = max(1, wait_s // 60)
             return (f"⏳ **Groq daily token limit reached.** Retry in ~{mins} min. "
-                    f"This is **account-level** (200k/day), not session. "
-                    f"Upgrade: https://console.groq.com/settings/billing"), [], False
+                    f"This is **account-level** (200k/day), not session."), [], False
         return f"LLM error: {e}", [], False
     except Exception as e:
         err = str(e)
         if "429" in err or "rate_limit" in err.lower():
-            return (f"⏳ **Groq rate limit hit.** Check account-level reset at "
-                    f"https://console.groq.com/settings/billing"), [], False
+            return "⏳ **Groq rate limit hit.** Check https://console.groq.com/settings/billing", [], False
         return f"LLM error: {e}", [], False
 
-    # Self-check only for adversarial queries — doubles tokens on those
     if _needs_self_check(question) and not is_visual_query:
         try:
             check_msgs = [
@@ -388,7 +414,7 @@ def _ask_impl(question: str, history: list):
             if revised.strip():
                 answer = revised
         except Exception:
-            pass  # self-check failure → keep original answer
+            pass
 
     return normalize_citations(answer), retrieved, is_visual_query
 
@@ -543,7 +569,6 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     st.session_state.bypass_cache = st.checkbox(
         "Force fresh response (bypass cache)", value=False,
-        help="Skips cached answers. Costs tokens. Use for consistency tests.",
     )
     if st.button("Clear chat + reset usage", use_container_width=True):
         st.session_state.messages = []
@@ -552,9 +577,13 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("### 🔧 Model config")
-    st.caption(f"LLM: `{LLM_MODEL}`")
+    st.caption(f"**LLM:** `{LLM_MODEL}`")
     st.caption(f"Embedding: `{EMBED_MODEL.split('/')[-1]}`")
-    st.caption(f"TOP_K: {TOP_K} · Self-check: {'on' if _needs_self_check else 'auto'}")
+    st.caption(f"TOP_K: {TOP_K} · Self-check: auto")
+    with st.expander("Available models"):
+        for m in AVAILABLE_MODELS:
+            mark = "✅ " if m == LLM_MODEL else "   "
+            st.caption(f"{mark}`{m}`")
 
     st.markdown("### 📊 Session usage")
     st.metric("Total tokens", f"{st.session_state.usage['total']:,}")
@@ -563,10 +592,11 @@ with st.sidebar:
         f"Completion: {st.session_state.usage['completion']:,} · "
         f"Calls: {st.session_state.usage['calls']}"
     )
-    avg = st.session_state.usage['total'] / max(1, st.session_state.usage['calls'])
-    st.caption(f"Avg cost/call: **{avg:,.0f}** tokens")
+    if st.session_state.usage['calls'] > 0:
+        avg = st.session_state.usage['total'] / st.session_state.usage['calls']
+        st.caption(f"Avg cost/call: **{avg:,.0f}** tokens")
     st.caption(f"Est. remaining (200k cap): **{max(0, 200_000 - st.session_state.usage['total']):,}**")
-    st.caption("Free tier reset: daily. Check [console.groq.com](https://console.groq.com/settings/billing).")
+    st.caption("Free tier reset: daily. [Console](https://console.groq.com/settings/billing)")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
