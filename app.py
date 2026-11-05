@@ -88,7 +88,7 @@ if LLM_MODEL is None:
     st.stop()
 
 # =============================================================================
-# SYSTEM PROMPT  (all fixes 3/4/5/6 + 2dp hints)
+# SYSTEM PROMPT  (FIX 22 + 23: chart data / chart output rules)
 # =============================================================================
 SYSTEM_PROMPT = "\n".join([
     "You are a senior data science consultant for an airline passenger satisfaction model.",
@@ -121,6 +121,10 @@ SYSTEM_PROMPT = "\n".join([
     "SCATTER: list EVERY feature appearing in BOTH retrieved chunks. x=mean|SHAP|, y=odds ratio.",
     "",
     "CHART TYPE: bar for unordered categories (levers, segments, features). line only for ordered axes (time, delay buckets, rank). If user explicitly requests line for unordered categories, provide it + one sentence: 'Note: a bar chart is more appropriate for unordered categories.' Pie coerced to bar if values aren't compositional.",
+    "",
+    "CHART DATA: if values span different units (e.g., percent satisfaction AND decimal AUC on the same chart), split into separate charts or normalize. Never plot % and 0–1 metrics on the same axis.",
+    "",
+    "CHART OUTPUT: emit each chart exactly ONCE, inside a single ```chart block. Do NOT repeat the data as raw JSON after the fenced block. For multiple charts, emit MULTIPLE separate ```chart blocks — do NOT wrap them in a {\"charts\": [...]} object.",
     "",
     "CAPABILITY QUESTIONS: if user asks 'what can you do', 'what charts can you build', 'what plots are available' — describe in PROSE only. Do NOT emit chart JSON unless they ask for a specific chart.",
     "",
@@ -225,7 +229,6 @@ def _chart_hint(history: list, question: str) -> str:
     labels = ", ".join(f"{d.get('label','')}={d.get('value', d.get('x',''))}" for d in target.get("data", [])[:8])
     return f"{prefix}'{target.get('title','chart')}' with data: {labels}."
 
-# FIX 3: refusal follow-up detection
 def _last_was_refusal(history: list) -> bool:
     for m in reversed(history):
         if m.get("role") == "assistant":
@@ -239,7 +242,6 @@ def build_search_query(question: str, history: list) -> str:
     if not history:
         return question
     q_lower = question.lower().strip()
-    # FIX 3: meta-followup after refusal → return "" to trigger META mode
     if _last_was_refusal(history) and q_lower in META_FOLLOWUPS:
         return ""
     if len(question.split()) < 4 or any(t in q_lower for t in ANAPHORA_TOKENS):
@@ -258,7 +260,7 @@ def normalize_citations(text: str) -> str:
     return text.strip()
 
 # =============================================================================
-# VERIFICATION  (FIX 2: broader pattern + rounding tolerance)
+# VERIFICATION
 # =============================================================================
 NUM_PATTERN = re.compile(r'\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\b\d+\.\d{2,}\b|\b\d{5,}\b')
 
@@ -282,7 +284,6 @@ def verify_numbers(answer: str, retrieved: list) -> list:
             v = round(float(raw.replace(',', '')), 4)
         except ValueError:
             continue
-        # FIX 2: rounding-aware — 5.37 in answer matches 5.374 in context
         decimals = len(raw.split('.')[1]) if '.' in raw else 0
         if not any(round(c, decimals) == round(v, decimals) for c in ctx_nums):
             unverified.append(raw)
@@ -362,7 +363,7 @@ def _groq_call(messages, max_tok):
     raise last_err
 
 # =============================================================================
-# CORE ASK  (FIX 3: meta-followup handling)
+# CORE ASK
 # =============================================================================
 def _needs_self_check(question: str) -> bool:
     q = question.lower()
@@ -376,7 +377,6 @@ def _ask_impl(question: str, history: list):
     meta_mode = (search_q == "")
 
     if meta_mode:
-        # FIX 3: meta-followup after refusal — skip retrieval, explain the refusal
         last_user_q = next((m.get("content", "") for m in reversed(history) if m.get("role") == "user"), "")
         context = (
             f"META-INSTRUCTION: You just refused the user's previous question: '{last_user_q}'. "
@@ -457,7 +457,7 @@ def ask(question: str, history=None):
     return _ask_impl(question, history)
 
 # =============================================================================
-# PARSER  (FIX 1: rows/items/names aliases)
+# PARSER  (FIX 24: {"charts": [...]} wrapper flattening)
 # =============================================================================
 def _try_parse_chart(raw: str):
     raw = raw.strip()
@@ -469,6 +469,11 @@ def _try_parse_chart(raw: str):
         return None
     if not isinstance(data, dict):
         return None
+
+    # FIX 24a: unwrap {"charts": [...]} — return first inner, caller handles multi
+    if "charts" in data and isinstance(data["charts"], list) and "type" not in data:
+        # Return a sentinel indicating a wrapper — caller must iterate
+        return {"__wrapper__": True, "charts": data["charts"]}
 
     # FIX 1a: accept alternate top-level keys for the data array
     if "data" not in data:
@@ -519,6 +524,22 @@ def _try_parse_chart(raw: str):
                 return None
     return data
 
+def _try_parse_chart_multi(raw: str) -> list:
+    """Parse a raw JSON string into a list of chart dicts. Handles wrappers."""
+    result = _try_parse_chart(raw)
+    if result is None:
+        return []
+    if isinstance(result, dict) and result.get("__wrapper__"):
+        out = []
+        for inner in result.get("charts", []):
+            if isinstance(inner, dict):
+                inner_str = json.dumps(inner)
+                parsed = _try_parse_chart(inner_str)
+                if parsed and not (isinstance(parsed, dict) and parsed.get("__wrapper__")):
+                    out.append(parsed)
+        return out
+    return [result]
+
 def _find_matching_brace(text: str, start: int) -> int:
     if start >= len(text) or text[start] != "{":
         return -1
@@ -540,23 +561,30 @@ def parse_response(answer: str):
     charts = []
     clean_text = answer
     fenced = re.compile(r'```(?:chart|json)?\s*\n?([\s\S]*?)```', re.MULTILINE)
+
     def _replace(m):
-        d = _try_parse_chart(m.group(1))
-        if d:
-            charts.append(d); return ""
+        parsed = _try_parse_chart_multi(m.group(1))
+        if parsed:
+            charts.extend(parsed)
+            return ""
         return m.group(0)
+
     clean_text = fenced.sub(_replace, clean_text)
+
+    # Unfenced fallback — scan for bare JSON objects
     i = 0
     while i < len(clean_text):
         if clean_text[i] == "{":
             end = _find_matching_brace(clean_text, i)
             if end != -1:
-                d = _try_parse_chart(clean_text[i:end + 1])
-                if d:
-                    charts.append(d)
+                raw = clean_text[i:end + 1]
+                parsed = _try_parse_chart_multi(raw)
+                if parsed:
+                    charts.extend(parsed)
                     clean_text = clean_text[:i] + clean_text[end + 1:]
                     continue
         i += 1
+
     clean_text = clean_text.strip()
     if charts and clean_text == "The provided model artifacts do not contain this information.":
         clean_text = ""
