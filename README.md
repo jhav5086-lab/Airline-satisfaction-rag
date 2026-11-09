@@ -110,7 +110,7 @@ An airline wants to understand **which service levers most influence passenger s
 
 <div align="center">
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://airline-satisfaction-rag-kiawhwl3s7ebmbwnxfmnfw.streamlit.app)
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://airline-satisfaction-rag-np9wepjymfthguhzapp24hm.streamlit.app/)
 </div>
 
 **Sample questions to try:**
