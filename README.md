@@ -1,92 +1,117 @@
+<div align="center">
+
 # 🛫 Airline Satisfaction RAG
 
-A retrieval-augmented chatbot grounded in a trained machine learning model for airline passenger satisfaction prediction — with a post-processing verification layer that checks every number and citation against retrieved artifacts.
+**A retrieval-augmented chatbot grounded in a trained ML model — with a verification layer that catches hallucinations before they reach the user.**
 
-**Live App** · **Python** · **Streamlit** · **Groq**
+[![Live Demo](https://img.shields.io/badge/🚀_Live_Demo-Try_it_now-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](YOUR_STREAMLIT_URL_HERE)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Groq](https://img.shields.io/badge/LLM-Groq-F55036?style=for-the-badge)](https://groq.com/)
+[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
+
+[**Overview**](#-overview) · [**Features**](#-features) · [**Quick Start**](#-quick-start) · [**Examples**](#-example-behaviors) · [**Limitations**](#️-known-limitations) · [**Roadmap**](#️-roadmap)
+
+</div>
 
 ---
 
 ## 📌 Overview
 
-This project combines a statistically interpretable logistic regression model with a retrieval-augmented generation (RAG) system to create an interactive business intelligence tool. Stakeholders can ask natural-language questions about the satisfaction model and receive grounded, cited answers.
+This project combines a statistically interpretable **logistic regression model** with a **retrieval-augmented generation (RAG)** system to create an interactive business intelligence tool. Stakeholders can ask natural-language questions about the airline satisfaction model and receive grounded, cited answers.
 
-The RAG layer includes a **verification pipeline** that:
-- Checks every number in the answer against retrieved chunks
-- Verifies every `[Chunk Title]` citation matches a real retrieved chunk
-- Runs a self-check audit on adversarial queries (`confirm`, `prove`, `right?`) to catch false premises
-- Appends visible `⚠️` warnings when verification fails
+What makes this RAG different from a standard LLM wrapper:
 
-**Live Demo:** [Airline Satisfaction RAG](https://airline-satisfaction-rag.streamlit.app)
+> **Every factual claim is verified post-generation.** Numbers are checked against retrieved chunks. Citations are validated against real chunk titles. Adversarial queries get a second audit pass. When verification fails, `⚠️` warnings appear in the answer — never silent hallucination.
+
+<table>
+<tr>
+<td width="50%">
+
+### 🎯 What it does
+
+- Answers grounded in SHAP, coefficients, and what-if simulations
+- Generates charts (bar, line, pie, scatter) from verified data
+- Pushes back on false premises and misstated numbers
+- Refuses to answer from general knowledge
+- Explains *why* it refused when asked
+
+</td>
+<td width="50%">
+
+### 🛡️ What makes it defensible
+
+- **Numeric verification** — rounding-aware check against retrieved text
+- **Citation verification** — normalized title matching
+- **Self-check audit** — second LLM pass on adversarial queries
+- **Meta-refusal** — "why?" gets specific missing-data explanations
+- **Cost-aware** — live token budget in the sidebar
+
+</td>
+</tr>
+</table>
 
 ---
 
 ## 🎯 Business Context
 
-An airline wants to understand which service levers most influence passenger satisfaction — and by how much. Rather than a raw model, stakeholders need an interactive tool that answers:
+An airline wants to understand **which service levers most influence passenger satisfaction** — and by how much. Rather than a static report or a raw model, stakeholders need an interactive tool that answers:
 
-- "Which lever should we prioritize?"
-- "How does satisfaction vary by segment?"
-- "What does the model say about delays?"
-- "What are the limitations of this analysis?"
-
-This RAG system delivers exactly that — grounded in SHAP values, coefficients, what-if simulations, and an executive report.
+| Stakeholder question | How the RAG answers it |
+|---|---|
+| *"Which lever should we prioritize?"* | Grounded in what-if lift + cost × time weighting |
+| *"How does satisfaction vary by segment?"* | Cited from segment-level satisfaction artifacts |
+| *"What does the model say about delays?"* | Coefficient + odds ratio with significance caveat |
+| *"What are the limitations?"* | Explicit caveats chunk on causality and halo effect |
 
 ---
 
 ## ✨ Features
 
-### Model
-- **Two-model design** — Model A (predictive, all 33 raw ratings) and Model B (interpretive, aggregate + categorical features)
-- **Full-rank design** — uniquely identified coefficients with confidence intervals
-- **SHAP analysis** — model-agnostic feature attribution
-- **Constraint-aware what-if** — lever lift with cost × time weighting
-- **Kaggle submission** — Public LB: 0.94191
+### 🧠 Model
 
-### RAG
-- **Grounded answers** — every factual claim cites a retrieved chunk
-- **Number verification** — rounding-aware check against retrieved text; flags any figure not found
-- **Citation verification** — normalized title matching; flags hallucinated chunk names
-- **Self-check audit** — second LLM pass on adversarial queries catches false premises, causal overclaims, aggregate conflation, and unit-translation errors
-- **Type-aware retrieval** — boosts relevant chunk types based on query intent (multiplicative)
-- **Refusal behavior** — says "not in artifacts" rather than hallucinating
-- **Pushback on false premises** — corrects users who misstate numbers or claim causality from SHAP
-- **Meta refusal handling** — "why?" after a refusal explains what specific data is missing, rather than switching topics
+| Feature | Detail |
+|---|---|
+| **Two-model design** | Model A (predictive, 33 raw ratings) · Model B (interpretive, aggregates) |
+| **Full-rank design** | Uniquely identified coefficients with confidence intervals |
+| **SHAP analysis** | Model-agnostic feature attribution |
+| **Constraint-aware what-if** | Lever lift weighted by cost × time |
+| **Kaggle submission** | Public LB: **0.94191** |
 
-### Application
-- **Live public URL** — deployed on Streamlit Community Cloud
-- **Chat interface** — conversational, history preserved in session
-- **Chart generation** — bar / line / pie / scatter rendered via Altair
-- **Chart memory** — supports ordinal references (`previous chart`, `previous to previous`)
-- **Source transparency** — expandable panel showing retrieved chunks with **raw cosine similarity** (not boosted scores)
-- **Session cost tracker** — live token usage and remaining daily budget in the sidebar
-- **Model fallback chain** — resolves available Groq models at startup
+### 🔍 RAG Pipeline
+
+| Feature | Detail |
+|---|---|
+| **Grounded answers** | Every factual claim cites a retrieved chunk |
+| **Number verification** | Rounding-aware check against retrieved text |
+| **Citation verification** | Normalized title matching against retrieved chunks |
+| **Self-check audit** | Second LLM pass on adversarial queries |
+| **Type-aware retrieval** | Multiplicative boost for intent-matched chunk types |
+| **Refusal behavior** | Says *"not in artifacts"* rather than hallucinating |
+| **Pushback** | Corrects false premises, misstated numbers, causal claims from SHAP |
+| **Meta-refusal** | Explains *what specific data is missing* when asked "why" |
+
+### 💻 Application
+
+| Feature | Detail |
+|---|---|
+| **Live deployment** | Streamlit Community Cloud |
+| **Chat interface** | Session-preserved history |
+| **Charts** | Bar · Line · Pie · Scatter via Altair |
+| **Chart memory** | Ordinal references (`previous chart`, `previous to previous`) |
+| **Source transparency** | Expandable panel with raw cosine similarity |
+| **Session tracker** | Live token usage in the sidebar |
+| **Model fallback** | Resolves available Groq models at startup |
 
 ---
 
 ## 🚀 Quick Start
 
-### Use the Live App
+### Try the Live App
 
-Just visit: [Airline Satisfaction RAG](https://airline-satisfaction-rag.streamlit.app)
+<div align="center">
 
-Try these questions:
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](YOUR_STREAMLIT_URL_HERE)
 
-- "What is the AUC of Model A?"
-- "Which service lever should we prioritize first, and why?"
-- "What are the limitations of this analysis?"
-- "Why not XGBoost?"
-- "How satisfied are Business class Business travelers?"
-- "Compare the odds ratio of Customer Type with the mean |SHAP| value of Type of Travel"
-- "Generate a bar chart of the top 5 SHAP drivers"
+</div>
 
-### Run Locally
-
-```bash
-git clone https://github.com/jhav5086-lab/Airline-satisfaction-rag.git
-cd Airline-satisfaction-rag
-pip install -r requirements.txt
-
-mkdir -p .streamlit
-echo 'GROQ_API_KEY = "your_key_here"' > .streamlit/secrets.toml
-
-streamlit run app.py
+**Sample questions to try:**
